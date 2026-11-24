@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install pinned tools
+        run: python -m pip install "ruff==0.16.1" "mypy==2.3.0"
+      - name: Lint
+        run: |
+          ruff check src/bin/model-profile scripts tests
+          ruff format --check src/bin/model-profile scripts tests
+      - name: Type check
+        run: |
+          for target in src/bin/model-profile scripts/install.py scripts/build_bundle.py; do
+            mypy --strict "$target"
+          done
+      - name: Test
+        run: python -I -m unittest discover -s tests -v

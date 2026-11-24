@@ -1,0 +1,1768 @@
+#!/usr/bin/env python3
+"""Toggle the Claude model-routing profile on or off.
+
+on      install the routed subagents (Haiku: Explore, log-reader; Opus: deep-reasoner)
+        and set the default model to `opusplan` (Opus plans, Sonnet executes) at
+        effort `medium`
+off     remove exactly what `on` installed and restore the previous model/effort
+status  show whether the profile is active
+
+Guarantees:
+- Only the settings keys listed in PROFILE_SETTINGS and the agent files this tool
+  installed are ever changed. settings.json is re-serialised with 2-space indent.
+- A value you changed while the profile was ON is kept on `off`, with a warning.
+- An agent file you edited while the profile was ON is left in place on `off`.
+- A failed `on` is rolled back completely.
+- Concurrent runs are rejected by a file lock.
+"""
+
+from __future__ import annotations
+
+import copy
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess  # nosec B404 - runs git only, fixed argv, no shell
+import sys
+import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+JsonObject = dict[str, Any]
+
+CLAUDE_DIR = Path.home() / ".claude"
+PROFILE_DIR = CLAUDE_DIR / "model-profile"
+PROFILE_AGENTS_DIR = PROFILE_DIR / "agents"
+STATE_FILE = PROFILE_DIR / "state.json"
+VERSION_FILE = PROFILE_DIR / "VERSION"
+LOCK_FILE = PROFILE_DIR / ".lock"
+HISTORY_FILE = PROFILE_DIR / "history.jsonl"
+SETTINGS_FILE = CLAUDE_DIR / "settings.json"
+INSTALLED_AGENTS_DIR = CLAUDE_DIR / "agents"
+PROFILE_SKILLS_DIR = PROFILE_DIR / "skills"
+INSTALLED_SKILLS_DIR = CLAUDE_DIR / "skills"
+SKILL_FILE = "SKILL.md"
+SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+SYNC_LOG = PROFILE_DIR / "sync.log"
+
+PROFILE_SETTINGS: JsonObject = {"model": "opusplan", "effortLevel": "medium"}
+AGENT_SUFFIX = ".md"
+# Claude Code hook events that run `sync`: right after a model switch, when a session starts,
+# and on every prompt (a safety net in case a switch is made some other way).
+# `python3 -I` (isolated mode) ignores PYTHONPATH, the current directory and user site-packages,
+# so a planted module in a project folder can never run when a hook fires on every prompt.
+SYNC_COMMAND = 'python3 -I "$HOME/.claude/bin/model-profile" sync 2>/dev/null || true'
+CONTEXT_COMMAND = (
+    'python3 -I "$HOME/.claude/bin/model-profile" context 2>/dev/null || true'
+)
+# Written by versions before 1.4.0: still recognised so upgrades and `off` clean them up.
+LEGACY_COMMANDS = frozenset(
+    {
+        '"$HOME/.claude/bin/model-profile" sync 2>/dev/null || true',
+        '"$HOME/.claude/bin/model-profile" context 2>/dev/null || true',
+        # 1.5.0 ran a separate snapshot hook per prompt; 1.6.0 folds it into prompt-start
+        'python3 -I "$HOME/.claude/bin/model-profile" snapshot 2>/dev/null || true',
+    }
+)
+# event -> the hook commands registered for it. `context` runs once per conversation (not per
+# prompt) so the standards cost a few dozen tokens per session instead of per message.
+# one process per prompt: auto-off check, review-gate snapshot and effort triage together
+PROMPT_START_COMMAND = (
+    'python3 -I "$HOME/.claude/bin/model-profile" prompt-start 2>/dev/null || true'
+)
+REVIEW_GATE_COMMAND = (
+    'python3 -I "$HOME/.claude/bin/model-profile" review-gate 2>/dev/null || true'
+)
+ROUTING_HOOKS: dict[str, tuple[str, ...]] = {
+    "PostModelSwitch": (SYNC_COMMAND,),
+    "SessionStart": (SYNC_COMMAND, CONTEXT_COMMAND),
+    "UserPromptSubmit": (PROMPT_START_COMMAND,),
+    "Stop": (REVIEW_GATE_COMMAND,),
+}
+ROUTING_COMMANDS = frozenset(c for commands in ROUTING_HOOKS.values() for c in commands)
+KNOWN_COMMANDS = ROUTING_COMMANDS | LEGACY_COMMANDS
+STANDARDS_FILE = PROFILE_DIR / "standards" / "standards.md"
+STANDARDS_MAX_CHARS = 4000
+HOOK_TIMEOUT_SECONDS = 10
+# Effort triage: a fast local classifier, so routine prompts cost nothing extra.
+CRITICAL_TOPICS = re.compile(
+    r"\b(security|vulnerab\w*|exploit\w*|auth|authenticat\w*|authori[sz]\w*|oauth|jwt|"
+    r"sso|login|password\w*|secrets?|credentials?|api keys?|billing|payments?|invoices?|"
+    r"stripe|refunds?|migrations?|production|prod|outage|incident|data loss|"
+    r"race conditions?|concurren\w*|deadlocks?|encrypt\w*|permissions?)\b",
+    re.IGNORECASE,
+)
+ACTION_WORDS = re.compile(
+    r"\b(fix\w*|chang\w*|implement\w*|add\w*|updat\w*|remov\w*|delet\w*|writ\w*|"
+    r"build\w*|refactor\w*|rewrit\w*|migrat\w*|deploy\w*|patch\w*|review\w*|audit\w*|"
+    r"debug\w*|investigat\w*|harden\w*|creat\w*|modif\w*|optimi[sz]\w*|improv\w*|"
+    r"speed up|make)\b",
+    re.IGNORECASE,
+)
+COMPLEX_SIGNALS = re.compile(
+    r"\b(refactor\w*|debug\w*|investigat\w*|root cause|architect\w*|design\w*|"
+    r"optimi[sz]\w*|performance|implement\w*|feature|integrat\w*|end[- ]to[- ]end|"
+    r"rewrit\w*|migrat\w*|upgrad\w*|failing|fails|regression|flaky)\b",
+    re.IGNORECASE,
+)
+REPEATED_FAILURE = re.compile(
+    r"\b(still (broken|failing|not working)|not working again|same (error|issue|problem)|"
+    r"keeps? failing|tried (twice|again))\b",
+    re.IGNORECASE,
+)
+CODE_PATH = re.compile(
+    r"[\w./-]+\.(?:py|ts|tsx|js|jsx|go|java|rb|php|cs|sql|ya?ml|tf|sh|kt|swift|rs)\b"
+)
+COMPLEX_PROMPT_CHARS = 800
+MIN_PROMPT_CHARS_FOR_DESIGN_TALK = 200
+MULTI_FILE_THRESHOLD = 3
+TRIAGE_MAX_REASONS = 3
+TRIAGE_ROUTINE = "routine"
+TRIAGE_COMPLEX = "complex"
+TRIAGE_CRITICAL = "critical"
+TRIAGE_HINTS: dict[str, str] = {
+    TRIAGE_COMPLEX: (
+        "Routing triage: this request looks complex ({reasons}). Unless it turns out "
+        "simple, invoke the deep-work skill before you start (high effort for this turn)."
+    ),
+    TRIAGE_CRITICAL: (
+        "Routing triage: this request looks critical ({reasons}). Unless it turns out "
+        "trivial, invoke the critical-work skill before you start (Opus, high effort for "
+        "this turn)."
+    ),
+}
+# the gate runs git on the whole working tree, so it gets more time than the other hooks
+HOOK_TIMEOUTS: dict[str, int] = {REVIEW_GATE_COMMAND: 30, PROMPT_START_COMMAND: 20}
+REVIEW_DIR = PROFILE_DIR / "review"
+SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+REVIEW_STATE_MAX_AGE_SECONDS = 7 * 24 * 3600
+HOOK_STDIN_MAX_BYTES = 1024 * 1024
+GIT_TIMEOUT_SECONDS = 5
+# no repo-configured programs may run from an automatic hook (fsmonitor, external diff, pager)
+GIT_SAFE_OPTIONS = (
+    "--no-pager",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
+    "diff.external=",
+    "-c",
+    "core.hooksPath=/dev/null",
+)
+STATUS_PATH_OFFSET = 3
+FINGERPRINT_MAX_FILES = 2000
+HASH_MAX_BYTES = 2 * 1024 * 1024
+NUMSTAT_MAX_PATHS = 200
+LINE_COUNT_CAP = 100_000
+TRANSCRIPT_LINE_MAX_CHARS = 4 * 1024 * 1024
+MAX_REVIEW_BLOCKS_PER_TASK = 2
+DEEP_REVIEW_MIN_LINES = 150
+DEEP_REVIEW_MIN_FILES = 8
+RISKY_PATH_PATTERN = re.compile(
+    r"auth|billing|payment|invoice|subscription|stripe|security|crypto|secret|"
+    r"password|token|permission|migration|webhook",
+    re.IGNORECASE,
+)
+STANDARD_REVIEWER = "code-reviewer"
+DEEP_REVIEWER = "deep-reasoner"
+REVIEWER_AGENTS = frozenset({STANDARD_REVIEWER, DEEP_REVIEWER})
+FILE_EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
+CHANGES_REQUIRED_MARKER = "VERDICT: CHANGES REQUIRED"
+VERIFY_COMMAND_PATTERN = re.compile(
+    r"\b(pytest|unittest|tox|nox|make\s+(test|tests|check|lint|build|ci|verify)|"
+    r"(npm|pnpm|yarn|bun)\s+(run\s+)?(test|lint|build|typecheck|type-check|check|verify)|"
+    r"jest|vitest|playwright\s+test|tsc|eslint|ruff|mypy|pyright|flake8|pylint|"
+    r"go\s+(test|vet|build)|cargo\s+(test|check|build|clippy)|mvn|gradlew?|"
+    r"dotnet\s+(test|build)|phpunit|rspec|next\s+build|node\s+--test|deno\s+test|"
+    r"swift\s+test|terraform\s+validate)\b",
+    re.IGNORECASE,
+)
+DOC_ONLY_PATH_PATTERN = re.compile(
+    r"(\.(md|mdx|markdown|txt|rst|adoc|png|jpe?g|gif|svg|webp|ico|pdf)$|"
+    r"(^|/)(LICENSE|NOTICE|AUTHORS|CHANGELOG)[^/]*$)",
+    re.IGNORECASE,
+)
+GENERIC_SECRET_KIND = "hard-coded credential"
+SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "private key",
+        re.compile(
+            r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"
+        ),
+    ),
+    ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("Stripe live key", re.compile(r"\b[rs]k_live_[0-9A-Za-z]{16,}\b")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b")),
+    ("GitLab token", re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b")),
+    ("Slack token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("Anthropic API key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
+    ("OpenAI API key", re.compile(r"\bsk-proj-[A-Za-z0-9_-]{20,}\b")),
+    (
+        GENERIC_SECRET_KIND,
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9])(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|"
+            r"client[_-]?secret|private[_-]?key)[\"']?\s*[:=]\s*[\"']([^\"'\s]{12,})[\"']"
+        ),
+    ),
+)
+SECRET_PLACEHOLDER_PATTERN = re.compile(
+    r"(?i)(example|placeholder|changeme|change_me|your[_-]|dummy|sample|redacted|fake|"
+    r"xxxx|\*\*\*|\$\{|<[^>]*>|%\(|\{\{|os\.environ|process\.env|getenv)"
+)
+FIXTURE_PATH_PATTERN = re.compile(
+    r"((^|/)(tests?|__tests__|spec|fixtures?|mocks?|testdata)/|(^|/)test_[^/]*$|"
+    r"_test\.[a-z]+$|\.(test|spec)\.[a-z]+$|\.(example|sample|template)(\.[a-z]+)?$)",
+    re.IGNORECASE,
+)
+HUNK_HEADER_PATTERN = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+SECRET_SCAN_MAX_FILES = 200
+SECRET_SCAN_MAX_BYTES = 1024 * 1024
+SECRET_SCAN_MAX_FINDINGS = 5
+REASON_MAX_FILES = 8
+PATH_DISPLAY_MAX_CHARS = 120
+SYNC_LOG_MAX_BYTES = 256 * 1024
+MODEL_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9._:\[\]-]{1,80}$")
+JSON_INDENT = 2
+DEFAULT_FILE_MODE = 0o600
+HASH_CHUNK_BYTES = 1 << 16
+RESTART_NOTICE = (
+    "Open a new conversation (or restart Claude Code) for this to take effect."
+)
+APPLY_HERE_NOTICE = (
+    "New conversations use routing automatically. A conversation where you already picked "
+    "a model keeps that model: to apply routing to this one now, run `/model opusplan`."
+)
+SESSION_START_EVENT = "SessionStart"
+SESSION_BANNER = (
+    "Model routing: ON (Opus plans, Sonnet works, Haiku searches). "
+    "Switch off with /model-profile off."
+)
+STATUSLINE_TAG_ON = "\033[38;5;71m[ROUTING:ON]\033[0m"
+STATUSLINE_TAG_OFF = "\033[38;5;245m[ROUTING:OFF]\033[0m"
+DEBUG_FLAG = PROFILE_DIR / "debug"
+DEBUG_PAYLOAD_MAX_BYTES = 64 * 1024
+MEANING_WHEN_ON = (
+    "meaning: cost-saving routing. Opus plans, Sonnet does the work, "
+    "Haiku handles search and logs, Opus is called for hard problems."
+)
+MEANING_WHEN_OFF = "meaning: standard setup. One default model, no helper agents."
+NEXT_WHEN_ON = "next: `/model-profile off` to switch off (terminal: ~/.claude/bin/model-profile off)"
+NEXT_WHEN_OFF = (
+    "next: `/model-profile on` to switch on (terminal: ~/.claude/bin/model-profile on)"
+)
+USAGE = (
+    "Model routing profile\n"
+    "  model-profile            show current state (same as `status`)\n"
+    "  model-profile on         switch the cost-saving routing on\n"
+    "  model-profile off        switch it off and restore your previous model\n"
+    "  model-profile status     show current state\n"
+    "  model-profile repair     re-apply routing if something changed it (e.g. the /model picker)\n"
+    "  model-profile sync       used by the Claude Code hook: switches routing off if you pick another model\n"
+    "  model-profile context    used by the Claude Code hook: adds your routing standards to each new conversation\n"
+    "  model-profile prompt-start used by the Claude Code hook: auto-off, review snapshot, effort triage\n"
+    "  model-profile review-gate  used by the Claude Code hook: requires an Opus review of changed files\n"
+    "  model-profile statusline used by the Claude Code status line: prints a [ROUTING:ON|OFF] tag\n"
+    "  model-profile version    show the installed version\n"
+    "  model-profile help       show this help\n"
+    "Inside Claude Code use `/model-profile on|off|status`.\n"
+    "Changes apply to new sessions; restart an open session to load them."
+)
+
+EXIT_OK = 0
+EXIT_FAILURE = 1
+EXIT_USAGE = 2
+
+
+class ProfileError(Exception):
+    """A condition that must abort the command with a clear message."""
+
+
+class BusyError(ProfileError):
+    """Another model-profile run holds the lock."""
+
+
+def warn(message: str) -> None:
+    sys.stderr.write(f"model-profile: warning: {message}\n")
+
+
+@contextmanager
+def exclusive_lock() -> Iterator[None]:
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("a", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise BusyError("another model-profile run is in progress") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def read_json_object(path: Path) -> JsonObject:
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ProfileError(f"missing file: {path}") from None
+    except (OSError, ValueError) as err:
+        raise ProfileError(f"cannot read {path}: {err}") from err
+    if not isinstance(parsed, dict):
+        raise ProfileError(f"expected a JSON object in {path}")
+    return parsed
+
+
+def serialise_json(payload: JsonObject) -> bytes:
+    """UTF-8 JSON that keeps non-ASCII text readable, escaping only what UTF-8 cannot hold.
+
+    A lone surrogate (legal in JSON, impossible in UTF-8) would otherwise make the write fail.
+    """
+    try:
+        text = json.dumps(payload, indent=JSON_INDENT, ensure_ascii=False)
+        return (text + "\n").encode("utf-8")
+    except UnicodeEncodeError:
+        return (
+            json.dumps(payload, indent=JSON_INDENT, ensure_ascii=True) + "\n"
+        ).encode("ascii")
+
+
+def write_json_atomic(path: Path, payload: JsonObject) -> None:
+    """Replace `path` (following symlinks) durably, keeping its permission bits."""
+    target = path.resolve()
+    try:
+        mode = stat.S_IMODE(target.stat().st_mode)
+    except FileNotFoundError:
+        mode = DEFAULT_FILE_MODE
+
+    content = serialise_json(payload)
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_path, mode)
+        temp_path.replace(target)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+SettingsSignature = tuple[int, int] | None
+
+
+def settings_signature() -> SettingsSignature:
+    """Identify the current settings.json (mtime and size) to detect a concurrent change."""
+    try:
+        stats = SETTINGS_FILE.resolve().stat()
+    except FileNotFoundError:
+        return None
+    return (stats.st_mtime_ns, stats.st_size)
+
+
+def write_settings_checked(payload: JsonObject, expected: SettingsSignature) -> None:
+    """Refuse to overwrite a settings.json that changed since it was read.
+
+    Claude Code and other tools write this file too; the check shrinks the window in which
+    their change could be lost from "the whole command" to the instant before the swap.
+    """
+    if settings_signature() != expected:
+        raise ProfileError(
+            "settings.json changed while it was being updated; run the command again"
+        )
+    write_json_atomic(SETTINGS_FILE, payload)
+
+
+def read_settings() -> JsonObject:
+    """Return settings.json, or an empty object when the file does not exist yet."""
+    if not SETTINGS_FILE.exists():
+        return {}
+    return read_json_object(SETTINGS_FILE)
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(HASH_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def is_valid_agent_name(name: str) -> bool:
+    return (
+        name.endswith(AGENT_SUFFIX)
+        and len(name) > len(AGENT_SUFFIX)
+        and Path(name).name == name
+    )
+
+
+@dataclass(frozen=True)
+class ProfileState:
+    previous_settings: JsonObject
+    installed_agents: dict[str, str]
+    created_agents_dir: bool
+    installed_skills: dict[str, str] = field(default_factory=dict)
+    created_skills_dir: bool = False
+
+    def to_json(self) -> JsonObject:
+        return {
+            "previous_settings": self.previous_settings,
+            "installed_agents": self.installed_agents,
+            "created_agents_dir": self.created_agents_dir,
+            "installed_skills": self.installed_skills,
+            "created_skills_dir": self.created_skills_dir,
+        }
+
+
+def load_state() -> ProfileState:
+    raw = read_json_object(STATE_FILE)
+    previous = raw.get("previous_settings")
+    agents = raw.get("installed_agents")
+    created_dir = raw.get("created_agents_dir")
+
+    damaged = f"state file damaged ({STATE_FILE}); fix or delete it"
+    if not isinstance(previous, dict) or not set(previous) <= set(PROFILE_SETTINGS):
+        raise ProfileError(damaged)
+    if not isinstance(agents, dict) or not all(
+        is_valid_agent_name(name) and isinstance(digest, str)
+        for name, digest in agents.items()
+    ):
+        raise ProfileError(damaged)
+    if not isinstance(created_dir, bool):
+        raise ProfileError(damaged)
+    skills = raw.get(
+        "installed_skills", {}
+    )  # absent in state files written before 1.6.0
+    created_skills = raw.get("created_skills_dir", False)
+    if not isinstance(skills, dict) or not all(
+        isinstance(name, str)
+        and SKILL_NAME_PATTERN.fullmatch(name)
+        and isinstance(digest, str)
+        for name, digest in skills.items()
+    ):
+        raise ProfileError(damaged)
+    if not isinstance(created_skills, bool):
+        raise ProfileError(damaged)
+    return ProfileState(previous, agents, created_dir, skills, created_skills)
+
+
+def _is_routing_hook(entry: object, commands: frozenset[str] = KNOWN_COMMANDS) -> bool:
+    return isinstance(entry, dict) and entry.get("command") in commands
+
+
+def _group_has_command(group: object, command: str) -> bool:
+    inner = group.get("hooks") if isinstance(group, dict) else None
+    return isinstance(inner, list) and any(
+        isinstance(entry, dict) and entry.get("command") == command for entry in inner
+    )
+
+
+def _group_has_routing_hook(
+    group: object, commands: frozenset[str] = KNOWN_COMMANDS
+) -> bool:
+    inner = group.get("hooks") if isinstance(group, dict) else None
+    return isinstance(inner, list) and any(
+        _is_routing_hook(entry, commands) for entry in inner
+    )
+
+
+def _without_commands(groups: list[Any], commands: frozenset[str]) -> list[Any]:
+    """Groups with the given hook commands removed; a group left empty is dropped."""
+    kept: list[Any] = []
+    for group in groups:
+        if not _group_has_routing_hook(group, commands):
+            kept.append(group)
+            continue
+        remaining = [e for e in group["hooks"] if not _is_routing_hook(e, commands)]
+        if remaining:
+            kept.append({**group, "hooks": remaining})
+    return kept
+
+
+def _hooks_section(settings: JsonObject) -> JsonObject:
+    hooks = settings.get("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ProfileError("settings.json `hooks` must be an object")
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            raise ProfileError(f"settings.json `hooks.{event}` must be a list")
+    return hooks
+
+
+def routing_hooks_installed(settings: JsonObject) -> bool:
+    try:
+        hooks = _hooks_section(settings)
+    except ProfileError:
+        return False
+    return all(
+        any(_group_has_command(group, command) for group in hooks.get(event, []))
+        for event, commands in ROUTING_HOOKS.items()
+        for command in commands
+    )
+
+
+def add_routing_hooks(settings: JsonObject) -> JsonObject:
+    """Return settings with the routing hooks registered for every event (idempotent)."""
+    settings = remove_routing_hooks(settings, LEGACY_COMMANDS)
+    hooks = copy.deepcopy(_hooks_section(settings))
+    for event in list(hooks):
+        misplaced = ROUTING_COMMANDS - set(ROUTING_HOOKS.get(event, ()))
+        hooks[event] = _without_commands(hooks[event], misplaced)
+        if not hooks[event]:
+            del hooks[event]
+    for event, commands in ROUTING_HOOKS.items():
+        groups = hooks.setdefault(event, [])
+        for command in commands:
+            if not any(_group_has_command(group, command) for group in groups):
+                groups.append(
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": command,
+                                "timeout": HOOK_TIMEOUTS.get(
+                                    command, HOOK_TIMEOUT_SECONDS
+                                ),
+                            }
+                        ]
+                    }
+                )
+    return {**settings, "hooks": hooks}
+
+
+def remove_routing_hooks(
+    settings: JsonObject, commands: frozenset[str] = KNOWN_COMMANDS
+) -> JsonObject:
+    """Return settings without our hook entries, leaving every other hook exactly as it was."""
+    if "hooks" not in settings:
+        return settings
+    hooks = _hooks_section(settings)
+    cleaned: JsonObject = {}
+    for event, groups in hooks.items():
+        kept = []
+        for group in groups:
+            if not _group_has_routing_hook(group, commands):
+                kept.append(group)
+                continue
+            remaining = [e for e in group["hooks"] if not _is_routing_hook(e, commands)]
+            if remaining:
+                kept.append({**group, "hooks": remaining})
+        if kept or not groups:
+            cleaned[event] = kept if kept else groups
+    if cleaned == hooks:
+        return settings
+    without_hooks = {key: value for key, value in settings.items() if key != "hooks"}
+    if not cleaned:
+        return without_hooks
+    return {**settings, "hooks": cleaned}
+
+
+def is_active() -> bool:
+    return STATE_FILE.exists()
+
+
+def profile_agent_files() -> list[Path]:
+    files = sorted(PROFILE_AGENTS_DIR.glob(f"*{AGENT_SUFFIX}"))
+    if not files:
+        raise ProfileError(f"no agent files in {PROFILE_AGENTS_DIR}")
+    return files
+
+
+def copy_agent_exclusive(source: Path, destination: Path) -> None:
+    """Create `destination` atomically; fails on any existing path, even a dangling symlink."""
+    try:
+        with source.open("rb") as reader, destination.open("xb") as writer:
+            shutil.copyfileobj(reader, writer)
+    except FileExistsError:
+        raise ProfileError(
+            f"refusing to overwrite existing file: {destination}"
+        ) from None
+    shutil.copystat(source, destination)
+
+
+def profile_skill_names() -> list[str]:
+    """Skills shipped with the profile (each a folder holding SKILL.md); optional."""
+    if not PROFILE_SKILLS_DIR.is_dir():
+        return []
+    return sorted(
+        d.name
+        for d in PROFILE_SKILLS_DIR.iterdir()
+        if d.is_dir()
+        and not d.is_symlink()
+        and SKILL_NAME_PATTERN.fullmatch(d.name)
+        and (d / SKILL_FILE).is_file()
+    )
+
+
+def remove_empty_dir(directory: Path) -> None:
+    if directory.is_symlink() or not directory.is_dir():
+        return
+    try:
+        directory.rmdir()
+    except OSError:
+        return
+
+
+def remove_installed_skills(skills: dict[str, str], created_root: bool) -> None:
+    for name, expected_digest in skills.items():
+        skill_dir = INSTALLED_SKILLS_DIR / name
+        path = skill_dir / SKILL_FILE
+        if os.path.lexists(path):
+            just_created = expected_digest == ""  # rollback of a copy made moments ago
+            modified = (
+                path.is_symlink()
+                or not path.is_file()
+                or (not just_created and sha256_of(path) != expected_digest)
+            )
+            if modified:
+                warn(f"left in place, modified since install: {path}")
+                continue
+            path.unlink()
+        remove_empty_dir(skill_dir)
+    if created_root:
+        remove_empty_dir(INSTALLED_SKILLS_DIR)
+
+
+def remove_empty_agents_dir() -> None:
+    if INSTALLED_AGENTS_DIR.is_symlink() or not INSTALLED_AGENTS_DIR.is_dir():
+        return
+    try:
+        INSTALLED_AGENTS_DIR.rmdir()
+    except OSError:
+        return
+
+
+def rollback_enable(
+    installed: dict[str, str],
+    created_agents_dir: bool,
+    skills: dict[str, str] | None = None,
+    created_skills_dir: bool = False,
+) -> None:
+    try:
+        remove_installed_skills(skills or {}, created_skills_dir)
+    except OSError as err:
+        warn(f"rollback could not remove skills: {err}")
+    for name in installed:
+        try:
+            (INSTALLED_AGENTS_DIR / name).unlink(missing_ok=True)
+        except OSError as err:
+            warn(f"rollback could not remove {INSTALLED_AGENTS_DIR / name}: {err}")
+    try:
+        STATE_FILE.unlink(missing_ok=True)
+    except OSError as err:
+        warn(f"rollback could not remove {STATE_FILE}: {err}")
+    if created_agents_dir:
+        remove_empty_agents_dir()
+
+
+def enable() -> None:
+    if is_active():
+        raise ProfileError("already ON. Run `off` first to reset.")
+
+    sources = profile_agent_files()
+    skill_names = profile_skill_names()
+    conflicts = [
+        INSTALLED_AGENTS_DIR / source.name
+        for source in sources
+        if os.path.lexists(INSTALLED_AGENTS_DIR / source.name)
+    ] + [
+        INSTALLED_SKILLS_DIR / name
+        for name in skill_names
+        if os.path.lexists(INSTALLED_SKILLS_DIR / name)
+    ]
+    if conflicts:
+        raise ProfileError(
+            "refusing to overwrite existing agent file(s): "
+            + ", ".join(map(str, conflicts))
+        )
+    read_settings()
+
+    created_agents_dir = not os.path.lexists(INSTALLED_AGENTS_DIR)
+    created_skills_dir = bool(skill_names) and not os.path.lexists(INSTALLED_SKILLS_DIR)
+    installed: dict[str, str] = {}
+    skills: dict[str, str] = {}
+    try:
+        INSTALLED_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+        for source in sources:
+            destination = INSTALLED_AGENTS_DIR / source.name
+            copy_agent_exclusive(source, destination)
+            installed[source.name] = sha256_of(destination)
+        for name in skill_names:
+            skill_dir = INSTALLED_SKILLS_DIR / name
+            skill_dir.mkdir(parents=True, exist_ok=False)
+            skills[name] = ""  # recorded before the copy so a failure is rolled back
+            copy_agent_exclusive(
+                PROFILE_SKILLS_DIR / name / SKILL_FILE, skill_dir / SKILL_FILE
+            )
+            skills[name] = sha256_of(skill_dir / SKILL_FILE)
+
+        signature = settings_signature()
+        settings = read_settings()
+        previous = {key: settings[key] for key in PROFILE_SETTINGS if key in settings}
+        state = ProfileState(
+            previous, installed, created_agents_dir, skills, created_skills_dir
+        )
+        write_json_atomic(STATE_FILE, state.to_json())
+        write_settings_checked(
+            add_routing_hooks({**settings, **PROFILE_SETTINGS}), signature
+        )
+    except BaseException:
+        rollback_enable(installed, created_agents_dir, skills, created_skills_dir)
+        raise
+
+
+def restore_owned_settings(
+    settings: JsonObject, previous: JsonObject
+) -> tuple[JsonObject, list[str]]:
+    """Undo the profile's keys in place, keeping any value the user changed since."""
+    restored: JsonObject = {}
+    kept_user_keys: list[str] = []
+    for key, value in settings.items():
+        if key not in PROFILE_SETTINGS:
+            restored[key] = value
+        elif value != PROFILE_SETTINGS[key]:
+            restored[key] = value
+            kept_user_keys.append(key)
+        elif key in previous:
+            restored[key] = previous[key]
+    return restored, kept_user_keys
+
+
+def remove_installed_agents(state: ProfileState) -> None:
+    for name, expected_digest in state.installed_agents.items():
+        path = INSTALLED_AGENTS_DIR / name
+        if not os.path.lexists(path):
+            continue
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or sha256_of(path) != expected_digest
+        ):
+            warn(f"left in place, modified since install: {path}")
+            continue
+        path.unlink()
+    if state.created_agents_dir:
+        remove_empty_agents_dir()
+
+
+def disable() -> None:
+    if not is_active():
+        raise ProfileError("already OFF.")
+
+    state = load_state()
+    signature = settings_signature()
+    settings = read_settings()
+    restored, kept_user_keys = restore_owned_settings(settings, state.previous_settings)
+    for key in kept_user_keys:
+        warn(f"`{key}` was changed while the profile was ON; keeping your value")
+    restored = remove_routing_hooks(restored)
+    if restored != settings:
+        write_settings_checked(restored, signature)
+
+    remove_installed_agents(state)
+    remove_installed_skills(state.installed_skills, state.created_skills_dir)
+    STATE_FILE.unlink()
+
+
+def routing_drift(settings: JsonObject) -> list[str]:
+    """Describe each routing setting that no longer matches the profile while routing is ON."""
+    return [
+        f"`{key}` is {settings.get(key, '(default)')} (expected {expected})"
+        for key, expected in PROFILE_SETTINGS.items()
+        if settings.get(key) != expected
+    ]
+
+
+def repair() -> None:
+    """Re-apply the routing settings without touching what was saved for `off`."""
+    if not is_active():
+        raise ProfileError(
+            "routing is OFF; nothing to repair. Run `on` to switch it on."
+        )
+    signature = settings_signature()
+    settings = read_settings()
+    repaired = add_routing_hooks({**settings, **PROFILE_SETTINGS})
+    if repaired != settings:
+        write_settings_checked(repaired, signature)
+
+
+def describe_status() -> str:
+    settings = read_settings()
+    lines = [
+        f"profile: {'ON' if is_active() else 'OFF'}",
+        f"model: {settings.get('model', '(default)')}",
+        f"effortLevel: {settings.get('effortLevel', '(default)')}",
+    ]
+    if is_active():
+        lines.append("subagents: " + ", ".join(load_state().installed_agents))
+        lines.extend([MEANING_WHEN_ON, NEXT_WHEN_ON])
+        lines.append(
+            "auto-off: active (routing switches itself off if you choose another model)"
+            if routing_hooks_installed(settings)
+            else "auto-off: inactive (run `/model-profile repair`, then restart)"
+        )
+        lines.append(
+            "effort: medium by default; complex -> deep-work skill (high); "
+            "critical -> critical-work skill (Opus, high)"
+        )
+        lines.append(
+            "review gate: active (Opus reviews every finished task that changed files)"
+            if routing_hooks_installed(settings)
+            else "review gate: inactive (run `/model-profile repair`, then restart)"
+        )
+        lines.append(
+            "standards: active (added to each new conversation)"
+            if STANDARDS_FILE.is_file()
+            else f"standards: missing ({STANDARDS_FILE}); reinstall to restore"
+        )
+        drift = routing_drift(settings)
+        if drift:
+            lines.append(
+                "warning: routing is ON but "
+                + "; ".join(drift)
+                + ". Something changed it, "
+                "for example choosing a model with /model. Run `/model-profile repair` to re-apply."
+            )
+    else:
+        lines.extend([MEANING_WHEN_OFF, NEXT_WHEN_OFF])
+    return "\n".join(lines)
+
+
+def record_history(state: str, reason: str | None = None) -> None:
+    """Append an ON/OFF event to the local history log."""
+    event = {"ts": datetime.now(timezone.utc).isoformat(), "state": state}
+    if reason is not None:
+        event["reason"] = reason
+    try:
+        with HISTORY_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event) + "\n")
+    except OSError as err:
+        warn(f"could not record usage history: {err}")
+
+
+def run_mutation(action: Callable[[], None], resulting_state: str) -> int:
+    with exclusive_lock():
+        action()
+        record_history(resulting_state)
+    notice = APPLY_HERE_NOTICE if resulting_state == "on" else RESTART_NOTICE
+    sys.stdout.write(describe_status() + "\n" + notice + "\n")
+    return EXIT_OK
+
+
+def log_sync_event(level: str, event: str, **fields: object) -> None:
+    """Append one JSON line to sync.log (size-capped); a failure is reported on stderr."""
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "level": level,
+        "event": event,
+        **fields,
+    }
+    try:
+        if SYNC_LOG.exists() and SYNC_LOG.stat().st_size > SYNC_LOG_MAX_BYTES:
+            # one atomic rename keeps the previous log as sync.log.1 and loses nothing
+            os.replace(SYNC_LOG, SYNC_LOG.with_name(SYNC_LOG.name + ".1"))
+        with SYNC_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
+    except (OSError, ValueError) as err:
+        sys.stderr.write(f"model-profile: cannot write {SYNC_LOG}: {err}\n")
+
+
+def sync() -> str | None:
+    """Switch routing OFF if the user has chosen another model; return the message to show.
+
+    Your choice is kept: `disable()` never overwrites a model you picked while routing was ON.
+    """
+    if not is_active():
+        return None
+    with exclusive_lock():
+        if not is_active():
+            return None
+        chosen = read_settings().get("model")
+        if chosen == PROFILE_SETTINGS["model"]:
+            return None
+        disable()
+        record_history("off", reason="model_changed")
+    if chosen is None:
+        label = "the default model"
+    elif isinstance(chosen, str) and MODEL_LABEL_PATTERN.fullmatch(chosen):
+        label = f"`{chosen}`"
+    else:
+        label = "an unrecognised model"  # never echo odd characters back into the UI
+    return (
+        f"Routing switched OFF because you chose {label}. Your choice is kept. "
+        "Run /model-profile on to switch routing back on."
+    )
+
+
+def hook_payload_models() -> dict[str, str]:
+    """From the hook's stdin, keep only the event name and model-looking string fields.
+
+    Everything else (notably prompt text) is discarded and never logged.
+    """
+    if sys.stdin.isatty():
+        return {}
+    try:
+        payload = json.loads(sys.stdin.read(DEBUG_PAYLOAD_MAX_BYTES) or "null")
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        key: value
+        for key, value in payload.items()
+        if isinstance(value, str)
+        and (key == "hook_event_name" or "model" in key.lower())
+    }
+
+
+def log_hook_invocation() -> None:
+    """Diagnostics (only while the `debug` flag file exists): what each hook run saw."""
+    try:
+        settings_model = read_settings().get("model")
+    except (ProfileError, OSError, ValueError):
+        settings_model = "<unreadable>"
+    log_sync_event(
+        "debug",
+        "hook_invoked",
+        hook=hook_payload_models(),
+        settings_model=settings_model,
+        routing_on=is_active(),
+    )
+
+
+def run_sync() -> int:
+    """Hook entry point: never fails and prints nothing unless it changed something."""
+    if DEBUG_FLAG.exists():
+        try:
+            log_hook_invocation()
+        except (ProfileError, OSError, ValueError) as err:
+            log_sync_event("error", "debug_log_failed", error=str(err))
+    try:
+        message = sync()
+    except BusyError:
+        return EXIT_OK
+    except (ProfileError, OSError, ValueError) as err:
+        log_sync_event("error", "sync_failed", error=str(err))
+        return EXIT_OK
+    if message is not None:
+        log_sync_event("info", "auto_off", message=message)
+        sys.stdout.write(json.dumps({"systemMessage": message}) + "\n")
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------------------
+# Opus review gate. `snapshot` (UserPromptSubmit) records the git state when a task starts;
+# `review-gate` (Stop) blocks the finish when files changed and no Opus review approved them.
+# Questions that change nothing are never reviewed, so they cost nothing.
+# --------------------------------------------------------------------------------------
+
+
+def read_hook_payload() -> JsonObject:
+    """The JSON object Claude Code sends a hook on stdin, or {} when absent or unreadable."""
+    if sys.stdin.isatty():
+        return {}
+    try:
+        payload = json.loads(sys.stdin.read(HOOK_STDIN_MAX_BYTES) or "null")
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def run_git(repo: str, *args: str) -> str | None:
+    """Run git with repository-configured command hooks disabled; None on any failure."""
+    try:
+        result = subprocess.run(  # nosec B603 - fixed argv, no shell; repo hooks disabled
+            ["git", *GIT_SAFE_OPTIONS, "-C", repo, *args],
+            capture_output=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+            timeout=GIT_TIMEOUT_SECONDS,
+            check=False,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def parse_porcelain_z(output: str) -> list[str]:
+    """Paths from `git status --porcelain=v1 -z` (renames and copies carry a second path)."""
+    paths: list[str] = []
+    entries = output.split("\0")
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if len(entry) < STATUS_PATH_OFFSET:
+            continue
+        paths.append(entry[STATUS_PATH_OFFSET:])
+        if entry[0] in "RC" and index < len(entries):
+            paths.append(entries[index])
+            index += 1
+    return paths
+
+
+def file_digest(path: Path) -> str:
+    try:
+        if path.is_symlink():
+            return "link:" + os.readlink(path)
+        if not path.exists():
+            return "deleted"
+        stats = path.stat()
+        if not path.is_file() or stats.st_size > HASH_MAX_BYTES:
+            return f"meta:{stats.st_size}:{stats.st_mtime_ns}"
+        return sha256_of(path)
+    except OSError:
+        return "unreadable"
+
+
+@dataclass(frozen=True)
+class TreeFingerprint:
+    """The dirty files of a git working tree (with content hashes) and its HEAD."""
+
+    root: str
+    head: str
+    files: dict[str, str]
+
+    def to_json(self) -> JsonObject:
+        return {"root": self.root, "head": self.head, "files": self.files}
+
+    @staticmethod
+    def from_json(raw: object) -> TreeFingerprint | None:
+        if not isinstance(raw, dict):
+            return None
+        root, head, files = raw.get("root"), raw.get("head"), raw.get("files")
+        if not (
+            isinstance(root, str) and isinstance(head, str) and isinstance(files, dict)
+        ):
+            return None
+        if not all(isinstance(k, str) and isinstance(v, str) for k, v in files.items()):
+            return None
+        return TreeFingerprint(root, head, files)
+
+
+def tree_fingerprint(directory: str) -> TreeFingerprint | None:
+    if not directory or not os.path.isdir(directory):
+        return None
+    root = run_git(directory, "rev-parse", "--show-toplevel")
+    if root is None:
+        return None
+    root = root.strip()
+    head = (run_git(root, "rev-parse", "--verify", "--quiet", "HEAD") or "").strip()
+    status = run_git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    if status is None:
+        return None
+    paths = parse_porcelain_z(status)[:FINGERPRINT_MAX_FILES]
+    return TreeFingerprint(root, head, {p: file_digest(Path(root) / p) for p in paths})
+
+
+def changed_paths(before: TreeFingerprint, after: TreeFingerprint) -> set[str]:
+    """Files whose content changed between two fingerprints, including commits made since."""
+    changed = {
+        path
+        for path in set(before.files) | set(after.files)
+        if before.files.get(path) != after.files.get(path)
+        # a file dirty before and still identical now was not touched by this task
+        and not (
+            path not in after.files
+            and before.files.get(path) == file_digest(Path(after.root) / path)
+        )
+    }
+    if before.head and after.head and before.head != after.head:
+        committed = run_git(
+            after.root, "diff", "--name-only", "-z", before.head, after.head
+        )
+        changed |= {p for p in (committed or "").split("\0") if p}
+    return changed
+
+
+def changed_line_estimate(root: str, paths: list[str]) -> int:
+    """Approximate added+deleted lines in `paths` (used only to choose the reviewer tier)."""
+    sample = paths[:NUMSTAT_MAX_PATHS]
+    output = run_git(root, "diff", "--numstat", "HEAD", "--", *sample) or ""
+    total = 0
+    counted: set[str] = set()
+    for line in output.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            counted.add(parts[2])
+            total += sum(int(n) for n in parts[:2] if n.isdigit())
+    for path in sample:
+        if path in counted:
+            continue
+        try:
+            with (Path(root) / path).open("rb") as handle:
+                total += sum(
+                    1 for _ in zip(range(LINE_COUNT_CAP), handle, strict=False)
+                )
+        except OSError:
+            continue
+    return total
+
+
+@dataclass(frozen=True)
+class ReviewCall:
+    agent: str
+    changes_required: bool
+
+
+@dataclass(frozen=True)
+class TurnActivity:
+    edited_files: list[str]
+    reviews: list[ReviewCall]
+    verified_after_last_edit: bool = False
+
+
+def _is_real_prompt(entry: JsonObject) -> bool:
+    if entry.get("type") != "user" or entry.get("isSidechain") or entry.get("isMeta"):
+        return False
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return True
+    return isinstance(content, list) and not any(
+        isinstance(block, dict) and block.get("type") == "tool_result"
+        for block in content
+    )
+
+
+def _result_text(block: JsonObject) -> str:
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+def turn_activity(transcript_path: object) -> TurnActivity:
+    """What happened since the user's latest prompt: file edits and reviewer calls."""
+    empty = TurnActivity([], [], False)
+    if not isinstance(transcript_path, str):
+        return empty
+    path = Path(transcript_path)
+    try:
+        if not path.resolve().is_relative_to((CLAUDE_DIR / "projects").resolve()):
+            return empty
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return empty
+    entries: list[JsonObject] = []
+    for line in lines:
+        if len(line) > TRANSCRIPT_LINE_MAX_CHARS:
+            continue
+        try:
+            entry = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    start = (
+        max((i for i, e in enumerate(entries) if _is_real_prompt(e)), default=-1) + 1
+    )
+    edited: list[str] = []
+    reviewer_ids: dict[str, str] = {}
+    reviews: list[ReviewCall] = []
+    check_ids: dict[str, int] = {}
+    check_results: list[tuple[int, bool]] = []
+    last_edit_position = -1
+    position = 0
+    for entry in entries[start:]:
+        content = (entry.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                position += 1
+                raw_input = block.get("input")
+                tool_input: JsonObject = (
+                    raw_input if isinstance(raw_input, dict) else {}
+                )
+                file_path = tool_input.get("file_path")
+                subagent = tool_input.get("subagent_type")
+                if block.get("name") in FILE_EDIT_TOOLS:
+                    last_edit_position = position
+                if block.get("name") in FILE_EDIT_TOOLS and isinstance(file_path, str):
+                    edited.append(file_path)
+                elif is_check_command(block.get("name"), tool_input):
+                    check_ids[str(block.get("id"))] = position
+                elif (
+                    block.get("name") == "Agent"
+                    and isinstance(subagent, str)
+                    and subagent in REVIEWER_AGENTS
+                ):
+                    reviewer_ids[str(block.get("id"))] = subagent
+            elif (
+                block.get("type") == "tool_result"
+                and str(block.get("tool_use_id")) in check_ids
+            ):
+                check_results.append(
+                    (
+                        check_ids[str(block.get("tool_use_id"))],
+                        block.get("is_error") is not True,
+                    )
+                )
+            elif (
+                block.get("type") == "tool_result"
+                and str(block.get("tool_use_id")) in reviewer_ids
+            ):
+                verdict_text = _result_text(block)
+                reviews.append(
+                    ReviewCall(
+                        reviewer_ids[str(block.get("tool_use_id"))],
+                        CHANGES_REQUIRED_MARKER in verdict_text,
+                    )
+                )
+    later_checks = sorted(r for r in check_results if r[0] > last_edit_position)
+    verified = bool(later_checks) and later_checks[-1][1]
+    return TurnActivity(sorted(set(edited)), reviews, verified)
+
+
+def is_check_command(tool_name: object, tool_input: JsonObject) -> bool:
+    """A foreground shell command that runs the project's tests, lint, type check or build."""
+    command = tool_input.get("command")
+    return (
+        tool_name == "Bash"
+        and isinstance(command, str)
+        and tool_input.get("run_in_background") is not True
+        and VERIFY_COMMAND_PATTERN.search(command) is not None
+    )
+
+
+@dataclass(frozen=True)
+class SecretFinding:
+    path: str
+    line: int
+    kind: str
+
+
+def secret_kind(text: str) -> str | None:
+    """The kind of credential a line seems to contain, never the value itself."""
+    for kind, pattern in SECRET_PATTERNS:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        evidence = text if kind == GENERIC_SECRET_KIND else match.group(0)
+        if SECRET_PLACEHOLDER_PATTERN.search(evidence) is None:
+            return kind
+    return None
+
+
+def _whole_file_lines(shown: str, path: Path) -> Iterator[tuple[str, int, str]]:
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(SECRET_SCAN_MAX_BYTES)
+    except OSError:
+        return
+    if b"\0" in raw:
+        return
+    for number, text in enumerate(raw.decode("utf-8", "replace").splitlines(), 1):
+        yield shown, number, text
+
+
+def added_lines(root: str | None, paths: list[str]) -> Iterator[tuple[str, int, str]]:
+    """Lines the task added: the uncommitted git diff, or whole files git cannot diff."""
+    sample = paths[:SECRET_SCAN_MAX_FILES]
+    diffed: set[str] = set()
+    if root is not None:
+        output = (
+            run_git(
+                root,
+                "diff",
+                "-U0",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "HEAD",
+                "--",
+                *sample,
+            )
+            or ""
+        )
+        current: str | None = None
+        number = 0
+        for line in output.splitlines():
+            if line.startswith("+++ "):
+                target = line[4:]
+                current = target[2:] if target.startswith("b/") else None
+                if current is not None:
+                    diffed.add(current)
+            elif line.startswith("@@"):
+                hunk = HUNK_HEADER_PATTERN.match(line)
+                number = int(hunk.group(1)) if hunk else 0
+            elif line.startswith("+") and current is not None:
+                yield current, number, line[1:]
+                number += 1
+    for path in sample:
+        if path not in diffed:
+            yield from _whole_file_lines(path, Path(root, path) if root else Path(path))
+
+
+def find_secrets(root: str | None, paths: list[str]) -> list[SecretFinding]:
+    findings: list[SecretFinding] = []
+    for path, number, text in added_lines(root, paths):
+        kind = secret_kind(text)
+        if kind == GENERIC_SECRET_KIND and FIXTURE_PATH_PATTERN.search(path):
+            continue
+        if kind is not None:
+            findings.append(SecretFinding(path, number, kind))
+            if len(findings) >= SECRET_SCAN_MAX_FINDINGS:
+                break
+    return findings
+
+
+def review_state_path(session_id: object) -> Path | None:
+    if not isinstance(session_id, str) or not SESSION_ID_PATTERN.fullmatch(session_id):
+        return None
+    return REVIEW_DIR / f"{session_id}.json"
+
+
+def prune_review_states(now: float) -> None:
+    for state in REVIEW_DIR.glob("*.json"):
+        try:
+            if now - state.stat().st_mtime > REVIEW_STATE_MAX_AGE_SECONDS:
+                state.unlink()
+        except OSError as err:
+            log_sync_event(
+                "warn", "review_state_prune_failed", path=str(state), error=str(err)
+            )
+
+
+def choose_reviewer(paths: list[str], changed_lines: int) -> str:
+    risky = any(RISKY_PATH_PATTERN.search(path) for path in paths)
+    big = changed_lines > DEEP_REVIEW_MIN_LINES or len(paths) > DEEP_REVIEW_MIN_FILES
+    return DEEP_REVIEWER if risky or big else STANDARD_REVIEWER
+
+
+def _display_path(path: str) -> str:
+    printable = "".join(ch for ch in path if ch.isprintable() and ch != "`")
+    return printable[:PATH_DISPLAY_MAX_CHARS]
+
+
+def review_instruction(agent: str, after_changes_required: bool) -> str:
+    if after_changes_required:
+        return (
+            "The last review requested changes. Fix every confirmed blocker or major finding, "
+            f"re-run the checks, then call the {agent} agent again on the updated diff"
+            " with the task goal, the file list and the `git diff` (plus the content of new files)."
+        )
+    return (
+        f"An Opus review is required before you finish. Call the {agent} agent with the task "
+        "goal, the file list and the `git diff` (plus the content of new files). Fix every "
+        "confirmed blocker or major finding and re-verify."
+    )
+
+
+def gate_instruction(
+    paths: list[str],
+    secrets: list[SecretFinding],
+    needs_check: bool,
+    review: str | None,
+) -> str:
+    shown = ", ".join(f"`{_display_path(p)}`" for p in paths[:REASON_MAX_FILES])
+    more = (
+        f" and {len(paths) - REASON_MAX_FILES} more"
+        if len(paths) > REASON_MAX_FILES
+        else ""
+    )
+    steps: list[str] = []
+    if secrets:
+        places = ", ".join(
+            f"`{_display_path(f.path)}:{f.line}` ({f.kind})" for f in secrets
+        )
+        steps.append(
+            f"Possible secret added at {places}. Remove it and load it from the environment "
+            "or a secret store instead; never repeat the value. If it is a deliberate test "
+            "fixture, say so in your final answer."
+        )
+    if needs_check:
+        steps.append(
+            "No passing test, lint, type-check or build run was seen after your last edit. "
+            "Run the project's own checks now and show the command and its result. If the "
+            "project has no checks, say so in your final answer."
+        )
+    if review is not None:
+        steps.append(review)
+    numbered = " ".join(f"{i}. {step}" for i, step in enumerate(steps, 1))
+    return (
+        f"Model routing review gate: this task changed {len(paths)} file(s): {shown}{more}. "
+        f"Before you finish: {numbered} Then finish, quoting the check result and the "
+        "review verdict in your final answer."
+    )
+
+
+def secret_key(finding: SecretFinding) -> str:
+    return f"{finding.path}:{finding.kind}"
+
+
+def secret_reminder(findings: list[SecretFinding]) -> JsonObject | None:
+    """Already flagged once and Claude chose to keep it: let it finish, but tell the user."""
+    if not findings:
+        return None
+    places = ", ".join(
+        f"`{_display_path(f.path)}:{f.line}` ({f.kind})" for f in findings
+    )
+    log_sync_event("warn", "secret_left_in_change", findings=len(findings))
+    return {
+        "systemMessage": f"Model routing: possible secret still in the change at {places}. "
+        "Check it before you commit."
+    }
+
+
+def give_up_notice(
+    blocks: int, secrets: bool, needs_check: bool, needs_review: bool
+) -> str:
+    missing = [
+        label
+        for label, flag in (
+            ("a possible secret is still in the change", secrets),
+            ("no passing check run was seen", needs_check),
+            ("the Opus review did not approve this change", needs_review),
+        )
+        if flag
+    ]
+    return (
+        f"Model routing: the review gate asked {blocks} times; "
+        + "; ".join(missing)
+        + ". Treat it as unreviewed."
+    )
+
+
+def review_gate_decision(payload: JsonObject, now: float) -> JsonObject | None:
+    """The Stop-hook output: a block with instructions, a notice, or None to allow."""
+    if not is_active():
+        return None
+    state_path = review_state_path(payload.get("session_id"))
+    if state_path is None:
+        return None
+    state = read_json_object(state_path) if state_path.is_file() else {}
+    before = TreeFingerprint.from_json(state.get("fingerprint"))
+    activity = turn_activity(payload.get("transcript_path"))
+    after = tree_fingerprint(before.root) if before is not None else None
+    root: str | None = None
+    if before is not None and after is not None:
+        root = after.root
+        paths = sorted(changed_paths(before, after))
+        lines = changed_line_estimate(root, paths) if paths else 0
+    else:
+        paths, lines = activity.edited_files, 0
+    if not paths:
+        return None
+    all_secrets = find_secrets(root, paths)
+    raw_flagged = state.get("secrets_flagged")
+    flagged = set(raw_flagged) if isinstance(raw_flagged, list) else set()
+    secrets = [f for f in all_secrets if secret_key(f) not in flagged]
+    needs_check = not activity.verified_after_last_edit and not all(
+        DOC_ONLY_PATH_PATTERN.search(path) for path in paths
+    )
+    last_review = activity.reviews[-1] if activity.reviews else None
+    needs_review = last_review is None or last_review.changes_required
+    if not (secrets or needs_check or needs_review):
+        return secret_reminder(all_secrets)
+    blocks = state.get("blocks", 0) if isinstance(state.get("blocks"), int) else 0
+    if blocks >= MAX_REVIEW_BLOCKS_PER_TASK:
+        log_sync_event(
+            "warn",
+            "review_gate_gave_up",
+            files=len(paths),
+            blocks=blocks,
+            secrets=len(secrets),
+            unchecked=needs_check,
+            unreviewed=needs_review,
+        )
+        return {
+            "systemMessage": give_up_notice(
+                blocks, bool(secrets), needs_check, needs_review
+            )
+        }
+    agent = choose_reviewer(paths, lines)
+    REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(
+        state_path,
+        {
+            **state,
+            "blocks": blocks + 1,
+            "updated": now,
+            "secrets_flagged": sorted(flagged | {secret_key(f) for f in secrets}),
+        },
+    )
+    log_sync_event(
+        "info",
+        "review_requested",
+        agent=agent if needs_review else None,
+        files=len(paths),
+        lines=lines,
+        secrets=len(secrets),
+        unchecked=needs_check,
+    )
+    review = (
+        review_instruction(agent, last_review is not None) if needs_review else None
+    )
+    return {
+        "decision": "block",
+        "reason": gate_instruction(paths, secrets, needs_check, review),
+    }
+
+
+def classify_prompt(text: object) -> tuple[str, list[str]]:
+    """Routine, complex or critical, with the matched signals (keywords only, never prompt text).
+
+    Conservative by design: a question that merely mentions a topic stays routine; escalation
+    needs an action or a hard-problem signal, so cheap prompts are never upgraded.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return TRIAGE_ROUTINE, []
+    critical = sorted({m.group(0).lower() for m in CRITICAL_TOPICS.finditer(text)})
+    complex_hits = sorted({m.group(0).lower() for m in COMPLEX_SIGNALS.finditer(text)})
+    has_action = ACTION_WORDS.search(text) is not None
+    repeated = REPEATED_FAILURE.search(text) is not None
+    files = len({m.group(0) for m in CODE_PATH.finditer(text)})
+    if repeated and (has_action or complex_hits or critical):
+        return TRIAGE_CRITICAL, ["repeated failure", *critical][:TRIAGE_MAX_REASONS]
+    if critical and (has_action or complex_hits):
+        return TRIAGE_CRITICAL, critical[:TRIAGE_MAX_REASONS]
+    long_prompt = len(text) > COMPLEX_PROMPT_CHARS
+    if (
+        (complex_hits and (has_action or len(text) > MIN_PROMPT_CHARS_FOR_DESIGN_TALK))
+        or files >= MULTI_FILE_THRESHOLD
+        or (long_prompt and has_action)
+    ):
+        reasons = complex_hits or ([f"{files} files"] if files else ["long request"])
+        return TRIAGE_COMPLEX, reasons[:TRIAGE_MAX_REASONS]
+    return TRIAGE_ROUTINE, []
+
+
+def triage_hint(level: str, reasons: list[str]) -> str | None:
+    template = TRIAGE_HINTS.get(level)
+    if template is None:
+        return None
+    return template.format(reasons=", ".join(reasons))
+
+
+def take_snapshot(payload: JsonObject) -> None:
+    """Remember the working tree as the task starts, for the review gate."""
+    state_path = review_state_path(payload.get("session_id"))
+    cwd = payload.get("cwd")
+    if state_path is None or not isinstance(cwd, str):
+        return
+    fingerprint = tree_fingerprint(cwd)
+    now = datetime.now(timezone.utc).timestamp()
+    REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(
+        state_path,
+        {
+            "fingerprint": fingerprint.to_json() if fingerprint else None,
+            "blocks": 0,
+            "updated": now,
+        },
+    )
+    prune_review_states(now)
+
+
+def run_prompt_start() -> int:
+    """UserPromptSubmit hook, one process: auto-off check, snapshot, effort triage. Never fails."""
+    payload = read_hook_payload()
+    output: JsonObject = {}
+    try:
+        message = sync()
+    except BusyError:
+        message = None
+    except (ProfileError, OSError, ValueError) as err:
+        log_sync_event("error", "sync_failed", error=str(err))
+        message = None
+    if message is not None:
+        log_sync_event("info", "auto_off", message=message)
+        output["systemMessage"] = message
+    try:
+        if is_active():
+            take_snapshot(payload)
+            level, reasons = classify_prompt(payload.get("prompt"))
+            hint = triage_hint(level, reasons)
+            if hint is not None:
+                output["hookSpecificOutput"] = {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": hint,
+                }
+                log_sync_event("info", "triage", triage=level)
+    except (ProfileError, OSError, ValueError, RecursionError) as err:
+        log_sync_event("error", "prompt_start_failed", error=str(err))
+    if output:
+        sys.stdout.write(json.dumps(output) + "\n")
+    return EXIT_OK
+
+
+def run_snapshot() -> int:
+    """Legacy (1.5.0) UserPromptSubmit hook: snapshot only. Kept until `repair` upgrades it."""
+    try:
+        if is_active():
+            take_snapshot(read_hook_payload())
+    except (ProfileError, OSError, ValueError, RecursionError) as err:
+        log_sync_event("error", "snapshot_failed", error=str(err))
+    return EXIT_OK
+
+
+def run_review_gate() -> int:
+    """Stop hook: require an Opus review of changed files. Fails open (never traps a session)."""
+    try:
+        decision = review_gate_decision(
+            read_hook_payload(), datetime.now(timezone.utc).timestamp()
+        )
+    except (ProfileError, OSError, ValueError, RecursionError) as err:
+        log_sync_event("error", "review_gate_failed", error=str(err))
+        return EXIT_OK
+    if decision is not None:
+        sys.stdout.write(json.dumps(decision) + "\n")
+    return EXIT_OK
+
+
+def read_standards() -> str:
+    """The routing standards text, capped so a careless edit cannot inflate every session."""
+    text = STANDARDS_FILE.read_text(encoding="utf-8").strip()
+    if len(text) > STANDARDS_MAX_CHARS:
+        log_sync_event(
+            "warn", "standards_truncated", chars=len(text), limit=STANDARDS_MAX_CHARS
+        )
+        return text[:STANDARDS_MAX_CHARS].rstrip()
+    return text
+
+
+def run_context() -> int:
+    """SessionStart hook: print the routing standards so they enter the new conversation.
+
+    Silent unless routing is ON and the model is still the profile's, and it never fails.
+    """
+    try:
+        if not is_active() or read_settings().get("model") != PROFILE_SETTINGS["model"]:
+            return EXIT_OK
+        text = read_standards()
+    except FileNotFoundError:
+        log_sync_event("warn", "standards_missing", path=str(STANDARDS_FILE))
+        return EXIT_OK
+    except (ProfileError, OSError, ValueError) as err:
+        log_sync_event("error", "context_failed", error=str(err))
+        return EXIT_OK
+    # a visible banner for the user, the standards as context for the model
+    output: JsonObject = {"systemMessage": SESSION_BANNER}
+    if text:
+        output["hookSpecificOutput"] = {
+            "hookEventName": SESSION_START_EVENT,
+            "additionalContext": text,
+        }
+    sys.stdout.write(json.dumps(output) + "\n")
+    return EXIT_OK
+
+
+def run_statusline() -> int:
+    """Status line entry point: a short ON/OFF tag, readable in any terminal. Never fails."""
+    try:
+        active = is_active()
+    except OSError:
+        active = False
+    sys.stdout.write(STATUSLINE_TAG_ON if active else STATUSLINE_TAG_OFF)
+    return EXIT_OK
+
+
+def run_repair() -> int:
+    with exclusive_lock():
+        repair()
+    sys.stdout.write(describe_status() + "\n" + APPLY_HERE_NOTICE + "\n")
+    return EXIT_OK
+
+
+def run_status() -> int:
+    sys.stdout.write(describe_status() + "\n")
+    return EXIT_OK
+
+
+def run_version() -> int:
+    try:
+        version = VERSION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        version = "unknown (not installed with the installer)"
+    sys.stdout.write(f"claude-model-profile {version}\n")
+    return EXIT_OK
+
+
+def run_help() -> int:
+    sys.stdout.write(USAGE + "\n")
+    return EXIT_OK
+
+
+def run_switch(turn_on: bool) -> int:
+    """Switch routing on or off; asking for the state it is already in is a harmless no-op."""
+    if is_active() == turn_on:
+        sys.stdout.write(
+            f"Routing is already {'ON' if turn_on else 'OFF'}; nothing changed.\n"
+            + describe_status()
+            + "\n"
+            + (APPLY_HERE_NOTICE + "\n" if turn_on else "")
+        )
+        return EXIT_OK
+    return run_mutation(enable if turn_on else disable, "on" if turn_on else "off")
+
+
+COMMANDS: dict[str, Callable[[], int]] = {
+    "on": lambda: run_switch(True),
+    "off": lambda: run_switch(False),
+    "status": run_status,
+    "repair": run_repair,
+    "sync": run_sync,
+    "context": run_context,
+    "statusline": run_statusline,
+    "snapshot": run_snapshot,
+    "prompt-start": run_prompt_start,
+    "review-gate": run_review_gate,
+    "version": run_version,
+    "--version": run_version,
+    "help": run_help,
+    "--help": run_help,
+    "-h": run_help,
+}
+NO_ARGUMENT_COMMAND = "status"
+
+
+PRIVATE_UMASK = 0o077
+
+
+def main(argv: list[str]) -> int:
+    os.umask(
+        PRIVATE_UMASK
+    )  # new files and folders are owner-only, whatever the shell's umask
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        sys.stderr.write(
+            "model-profile: do not run with sudo; it would make your settings root-owned\n"
+        )
+        return EXIT_FAILURE
+    command = (
+        NO_ARGUMENT_COMMAND if len(argv) == 1 else argv[1] if len(argv) == 2 else None
+    )
+    handler = COMMANDS.get(command) if command is not None else None
+    if handler is None:
+        sys.stderr.write(f"usage: model-profile on|off|status|repair|help\n\n{USAGE}\n")
+        return EXIT_USAGE
+    try:
+        return handler()
+    except (ProfileError, OSError, ValueError) as err:
+        sys.stderr.write(f"model-profile: {err}\n")
+        return EXIT_FAILURE
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
