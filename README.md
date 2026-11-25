@@ -16,9 +16,10 @@ Running everything on the most capable model is expensive. Running everything on
 
 Requirements: [Claude Code](https://claude.com/claude-code), Python 3.10 or newer, macOS or Linux, access to Opus, Sonnet and Haiku.
 
-**One file** (simplest). Download `install-claude-model-profile.sh` from the [latest release](https://github.com/sumanghosh22/claude-model-profile/releases/latest), then:
+**One file** (simplest). Download `install-claude-model-profile.sh` from the [latest release](https://github.com/sumanghosh22/claude-model-profile/releases/latest), or from a terminal (macOS and Linux):
 
 ```bash
+curl -fsSLO https://github.com/sumanghosh22/claude-model-profile/releases/latest/download/install-claude-model-profile.sh
 bash install-claude-model-profile.sh
 ```
 
@@ -35,7 +36,14 @@ Either way it installs and switches routing on. Then **restart Claude Code** and
 - Run the same command again any time to update; it keeps routing on.
 - To read the source first with the one-file installer: `bash install-claude-model-profile.sh --extract ./routing-src`. It unpacks the files and installs nothing.
 - To install without switching routing on: `./install.sh --friendly`, then `/model-profile on` when you are ready.
-- Each release lists a SHA-256 checksum beside the installer. `shasum -a 256 -c install-claude-model-profile.sh.sha256` shows the file arrived undamaged.
+- Each release lists a SHA-256 checksum beside the installer. Download `install-claude-model-profile.sh.sha256` next to it, then run `shasum -a 256 -c install-claude-model-profile.sh.sha256` on macOS or `sha256sum -c install-claude-model-profile.sh.sha256` on Linux. `OK` means the file arrived undamaged.
+
+### Linux notes
+
+- **Python 3.10 or newer** is required (`python3 --version`). Ubuntu 22.04+ and Debian 12+ have it. On Ubuntu 20.04 or Debian 11 the installer stops with a clear message and changes nothing; install a newer Python first.
+- It also needs only tools every distribution ships: `bash`, `tar`, `awk` and `mktemp`.
+- Do **not** run it with `sudo`. It installs into your own `~/.claude` and refuses to run as root through `sudo`, which would make that folder root-owned.
+- The test suite runs on Ubuntu with Python 3.10 and 3.13 in CI. If something behaves differently on your distribution, please [open an issue](https://github.com/sumanghosh22/claude-model-profile/issues).
 
 ## Daily use
 
