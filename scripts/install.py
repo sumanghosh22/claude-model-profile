@@ -10,13 +10,16 @@ Safety rules:
 - Files are tracked by SHA-256 in a manifest. A reinstall updates only files you have not edited.
 - If any target file was edited by you (or already exists and is not ours), nothing is changed
   unless you pass --force; --force keeps your version as <file>.bak-<timestamp> first.
-- Your ~/.claude/settings.json is only touched by `model-profile on|off`, never by this script.
+- Your ~/.claude/settings.json is only changed through `model-profile`: `on|off`, and after an
+  install `install-hooks`, which registers this version's hooks (the daily update check;
+  refreshed routing hooks while routing is on) and writes nothing otherwise.
 - `uninstall` keeps the on/off history unless you pass --purge.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -24,6 +27,8 @@ import shutil
 import subprocess  # nosec B404 - only runs our own installed script, with fixed arguments
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,6 +64,8 @@ RULES: tuple[Rule, ...] = (
     Rule("src/agents", "model-profile/agents", REGULAR_MODE),
     Rule("src/standards", "model-profile/standards", REGULAR_MODE),
     Rule("src/skills", "model-profile/skills", REGULAR_MODE, recursive=True),
+    # the release channel and signing key that automatic updates trust
+    Rule("src/channel", "model-profile/channel", REGULAR_MODE),
 )
 VERSION_DESTINATION = "model-profile/VERSION"
 PRODUCT_NAME = "Claude Model Profile"
@@ -67,6 +74,7 @@ CHECK_MARK = "\u2713"
 CHECK_MARK_FALLBACK = "[ok]"
 EMPTY_DIRS_TO_PRUNE = (
     "model-profile/agents",
+    "model-profile/channel",
     "model-profile/standards",
     "model-profile/review",
     "model-profile/skills",
@@ -74,7 +82,17 @@ EMPTY_DIRS_TO_PRUNE = (
     "commands",
     "bin",
 )
-RUNTIME_FILES = ("model-profile/.lock",)
+RUNTIME_FILES = (
+    "model-profile/.lock",
+    "model-profile/.update.lock",
+    "model-profile/.update-state.lock",
+    "model-profile/update-state.json",
+)
+# versions before this one have no `uninstall-hooks` command and never registered its hook
+FIRST_VERSION_WITH_HOOK_COMMANDS = (1, 11, 0)
+UPDATE_LOCK = "model-profile/.update.lock"
+# set by the automatic updater, which holds UPDATE_LOCK while it runs this installer
+UPDATER_ENV = "CLAUDE_MODEL_PROFILE_UPDATING"
 # per-session review-gate state (only files this tool names: <session>.json, never links)
 RUNTIME_DIRS = ("model-profile/review",)
 RUNTIME_SUFFIX = ".json"
@@ -256,6 +274,13 @@ def previous_version() -> str | None:
     return recorded if isinstance(recorded, str) and recorded else None
 
 
+def installed_version_tuple() -> tuple[int, ...]:
+    """The installed version as numbers; (0,) when unknown, so newer commands are not assumed."""
+    recorded = previous_version() or ""
+    parts = recorded.split(".")
+    return tuple(int(p) for p in parts) if all(p.isdigit() for p in parts) else (0,)
+
+
 def check_mark() -> str:
     encoding = (sys.stdout.encoding or "").lower().replace("-", "")
     return CHECK_MARK if encoding == "utf8" else CHECK_MARK_FALLBACK
@@ -324,6 +349,7 @@ def install(enable: bool, dry_run: bool, force: bool, friendly: bool = False) ->
         if target.is_file() and sha256_of(target) == manifest[name]:
             target.unlink()
     write_manifest(installed, version)
+    run_profile("install-hooks", quiet=True)
     if friendly:
         if enable and not profile_is_on():
             run_profile("on", quiet=True)
@@ -365,6 +391,27 @@ def profile_is_on() -> bool:
     return (claude_dir() / "model-profile" / "state.json").exists()
 
 
+@contextmanager
+def no_update_running() -> Iterator[None]:
+    """Install and uninstall never run while an automatic update is installing files."""
+    lock = claude_dir() / UPDATE_LOCK
+    if os.environ.get(UPDATER_ENV) or not lock.parent.is_dir():
+        yield
+        return
+    with lock.open("a", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise InstallError(
+                "an automatic update is being installed right now; nothing was changed. "
+                "Try again in a minute."
+            ) from None
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def prune_empty_tree(root: Path) -> None:
     """Remove empty folders below `root`, deepest first; never follows links."""
     if not root.is_dir() or root.is_symlink():
@@ -393,6 +440,8 @@ def uninstall(purge: bool, force: bool) -> int:
 
     if profile_is_on():
         run_profile("off")
+    if installed_version_tuple() >= FIRST_VERSION_WITH_HOOK_COMMANDS:
+        run_profile("uninstall-hooks", quiet=True)
     for name in manifest:
         (claude_dir() / name).unlink(missing_ok=True)
     for name in RUNTIME_FILES:
@@ -512,11 +561,14 @@ def main(argv: list[str]) -> int:
         sys.stderr.write("install.py: --purge only applies to uninstall\n")
         return EXIT_USAGE
     try:
-        if args.command == "uninstall":
-            return uninstall(args.purge, args.force)
         if args.command == "status":
             return status()
-        return install(args.enable, args.dry_run, args.force, args.friendly)
+        if args.dry_run:
+            return install(args.enable, args.dry_run, args.force, args.friendly)
+        with no_update_running():
+            if args.command == "uninstall":
+                return uninstall(args.purge, args.force)
+            return install(args.enable, args.dry_run, args.force, args.friendly)
     except (InstallError, OSError) as err:
         sys.stderr.write(f"install.py: {err}\n")
         return EXIT_FAILURE

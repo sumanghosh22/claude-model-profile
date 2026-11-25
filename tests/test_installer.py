@@ -125,10 +125,20 @@ class TestInstall(InstallerTestCase):
         for relative, digest in manifest.items():
             self.assertEqual(sha256(self.installed(relative)), digest)
 
-    def test_install_never_touches_settings_or_switches_routing_on(self) -> None:
-        before = self.settings.read_bytes()
+    def test_install_only_adds_the_update_hook_and_never_switches_routing_on(
+        self,
+    ) -> None:
         result = self.run_installer()
-        self.assertEqual(self.settings.read_bytes(), before)
+        settings = json.loads(self.settings.read_text())
+        hooks = settings.pop("hooks")
+        self.assertEqual(settings, BASELINE_SETTINGS, "model settings untouched")
+        self.assertEqual(
+            [h["command"] for group in hooks["SessionStart"] for h in group["hooks"]],
+            [
+                'python3 -I "$HOME/.claude/bin/model-profile" auto-update 2>/dev/null || true'
+            ],
+        )
+        self.assertEqual(list(hooks), ["SessionStart"], "no routing hooks while off")
         self.assertFalse(self.installed("model-profile/state.json").exists())
         self.assertIn("not switched on yet", result.stdout)
         self.assertFalse(

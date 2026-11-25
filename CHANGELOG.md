@@ -2,6 +2,24 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Versioning: [SemVer](https://semver.org/).
 
+## [1.11.0] - 2026-11-25
+
+### Added
+- **Automatic, signed updates.** Once a day, in the background, an install checks the latest release and installs it, so you get each new version without doing anything; the next conversation shows one line, "updated to X", with a link to what changed. A conversation never waits for the network, and updates keep working while routing is off.
+- **Every release is signed** (Ed25519, `ssh-keygen -Y sign`), and the signed installer states its own version. Before anything runs, the signature must verify against the key shipped in `src/channel/update-channel.json`, and the signed version must equal the release tag, be newer than the installed one and keep the major version. Refused, never run: unsigned or re-signed releases, an old signed installer replayed under a newer tag (no downgrades), a major version slipped in under a minor tag, oversized files, non-HTTPS links or redirects, a damaged channel file. Each refusal is shown once; offline is silent.
+- New major versions are announced, never installed automatically.
+- `/model-profile update`, `update-check`, `auto-update-on`, `auto-update-off`; `status` shows the update state. `CLAUDE_MODEL_PROFILE_NO_AUTO_UPDATE=1` also switches it off.
+- **Upgrades register new hooks.** Installing over an older version now adds any hook the new version needs, without `off` and `on`; it writes nothing when nothing is missing.
+- `build_bundle.py --sign KEY` signs a release build.
+
+### Upgrading
+- From 1.10.0 or earlier, run the one-file installer once more; from then on updates are automatic.
+
+### Verified
+- Two independent security reviews found 19 problems before release (among them: the version was checked only after the installer ran; upgrades by hand never registered the hook; switching routing off stopped updates; a stalled server could hold up a conversation start; an uninstall during an update could be undone; a busy settings lock could fail an update). All are fixed, each with a test.
+- The updater tests drive real signed releases from a local server: tampered, re-signed, unsigned, replayed, oversized, redirected, cut short, stalled, offline and concurrent. 38 safety checks were each removed in turn, and every removal made a test fail.
+- A real upgrade, from an installed 1.11.0 to a release signed with the real key, was driven end to end.
+
 ## [1.10.0] - 2026-11-25
 
 ### Added

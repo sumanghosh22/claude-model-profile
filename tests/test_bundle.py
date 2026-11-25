@@ -25,6 +25,23 @@ BUILD_SCRIPT = ROOT / "scripts" / "build_bundle.py"
 VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 BUNDLE_NAME = "install-claude-model-profile.sh"
 BASELINE_SETTINGS = {"model": "sonnet", "effortLevel": "high"}
+# every install registers exactly this one hook, outside routing, for daily signed updates
+UPDATE_HOOK_SETTINGS = {
+    "hooks": {
+        "SessionStart": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": 'python3 -I "$HOME/.claude/bin/model-profile" '
+                        "auto-update 2>/dev/null || true",
+                        "timeout": 10,
+                    }
+                ]
+            }
+        ]
+    }
+}
 SHIPPED_FILES = (
     "README.md",
     "LICENSE",
@@ -206,13 +223,16 @@ class TestOneCommandInstall(BundleTestCase):
         self.assertIn("Updated (was 0.9.0)", self.run_bundle().stdout)
 
     def test_friendly_without_enable_leaves_routing_off(self) -> None:
-        before = self.settings.read_bytes()
         result = self.run_bundle("--friendly")
         self.assertEqual(result.returncode, EXIT_OK, result.stderr)
         self.assertIn(
             "Routing is off. Switch it on with /model-profile on", result.stdout
         )
-        self.assertEqual(self.settings.read_bytes(), before)
+        self.assertEqual(
+            json.loads(self.settings.read_text()),
+            {**BASELINE_SETTINGS, **UPDATE_HOOK_SETTINGS},
+            "model settings untouched; only the update hook is added",
+        )
 
     def test_a_terminal_without_unicode_gets_a_plain_marker(self) -> None:
         module = load_script(
@@ -282,7 +302,11 @@ class TestOneCommandInstall(BundleTestCase):
             capture_output=True,
             check=True,
         )
-        self.assertEqual(json.loads(self.settings.read_text()), BASELINE_SETTINGS)
+        self.assertEqual(
+            json.loads(self.settings.read_text()),
+            {**BASELINE_SETTINGS, **UPDATE_HOOK_SETTINGS},
+            "off restores the model settings and keeps updates running",
+        )
 
     def test_status_dry_run_and_uninstall_pass_through(self) -> None:
         self.assertIn("not installed", self.run_bundle("status").stdout)

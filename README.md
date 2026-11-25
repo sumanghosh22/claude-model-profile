@@ -33,15 +33,16 @@ cd claude-model-profile
 
 Either way it installs and switches routing on. Then **restart Claude Code** and open a **new conversation** (conversations that were already open keep the model they had; in one of those, type `/model opusplan`). Type `/model-profile` to check it is on.
 
-- Run the same command again any time to update; it keeps routing on.
+- **Updates install themselves.** Once a day, in the background (a conversation never waits), it checks the latest release and installs it if the installer is signed by the maintainer's key; the next conversation shows one line, "updated to X". This keeps working while routing is off. New major versions are only announced. Run the same command again any time to update by hand; it keeps routing on.
+- Installed 1.10.0 or earlier? Run the one-file command once more to get 1.11.0; from then on updates are automatic.
 - To read the source first with the one-file installer: `bash install-claude-model-profile.sh --extract ./routing-src`. It unpacks the files and installs nothing.
 - To install without switching routing on: `./install.sh --friendly`, then `/model-profile on` when you are ready.
-- Each release lists a SHA-256 checksum beside the installer. Download `install-claude-model-profile.sh.sha256` next to it, then run `shasum -a 256 -c install-claude-model-profile.sh.sha256` on macOS or `sha256sum -c install-claude-model-profile.sh.sha256` on Linux. `OK` means the file arrived undamaged.
+- Each release lists a SHA-256 checksum beside the installer. Download `install-claude-model-profile.sh.sha256` next to it, then run `shasum -a 256 -c install-claude-model-profile.sh.sha256` on macOS or `sha256sum -c install-claude-model-profile.sh.sha256` on Linux. `OK` means the file arrived undamaged. From 1.11.0 each release also carries `install-claude-model-profile.sh.sig`, an Ed25519 signature that installed copies verify before every automatic update.
 
 ### Linux notes
 
 - **Python 3.10 or newer** is required (`python3 --version`). Ubuntu 22.04+ and Debian 12+ have it. On Ubuntu 20.04 or Debian 11 the installer stops with a clear message and changes nothing; install a newer Python first.
-- It also needs only tools every distribution ships: `bash`, `tar`, `awk` and `mktemp`.
+- It also needs only tools every distribution ships: `bash`, `tar`, `awk` and `mktemp`. Automatic updates also use `ssh-keygen` (package `openssh-client`, present on almost every system) to check signatures; without it, updates are refused and you are told once.
 - Do **not** run it with `sudo`. It installs into your own `~/.claude` and refuses to run as root through `sudo`, which would make that folder root-owned.
 - The test suite runs on Ubuntu with Python 3.10 and 3.13 in CI. If something behaves differently on your distribution, please [open an issue](https://github.com/sumanghosh22/claude-model-profile/issues).
 
@@ -55,6 +56,7 @@ Either way it installs and switches routing on. Then **restart Claude Code** and
 | A hard task, planned and checked step by step | `/complex <task>` |
 | Maximum thinking for one message | add `ultrathink` |
 | Force a hard problem to Opus | say "use deep-reasoner on this" |
+| Update now / stop automatic updates | `/model-profile update` · `/model-profile auto-update-off` |
 
 **Choosing a model yourself** with `/model` turns routing off automatically and keeps your choice. Switch it back on with `/model-profile on`.
 
@@ -92,13 +94,15 @@ It never traps a session: after two requests it lets Claude finish and tells you
 
 ## What it changes on your machine
 
-- `~/.claude/settings.json`: `model` (set to `opusplan`), `effortLevel`, and hooks on four events (model change, session start, each message, and when Claude finishes). `off` restores what you had and removes exactly what `on` added. Your own settings and hooks are left alone.
+- `~/.claude/settings.json`: `model` (set to `opusplan`), `effortLevel`, and hooks on four events (model change, session start, each message, and when Claude finishes). `off` restores what you had and removes exactly what `on` added. Your own settings and hooks are left alone. One more session-start hook, for automatic updates, is added at install, kept while routing is off, and removed by `uninstall`.
 - `~/.claude/agents/`: four helper agents while routing is on (`Explore` replaces the built-in one with a Haiku version).
 - `~/.claude/skills/`: `deep-work` and `critical-work` while routing is on. It refuses to install if you already have a skill with either name.
 - `~/.claude/commands/`: `/model-profile` and `/complex`.
 - `~/.claude/bin/` and `~/.claude/model-profile/`: the tool itself, your standards file, a small on/off history log, a size-capped event log (events only, never message text) and per-conversation review state (cleaned up after a week).
 
-Nothing is sent over the network. The hooks make no network calls, run in an isolated Python (`python3 -I`), and fail open: a problem in the tool can never block you from working.
+Nothing about you or your work is sent anywhere. The hooks run in an isolated Python (`python3 -I`) and fail open: a problem in the tool can never block you from working.
+
+**The one network use: updates.** At most once a day, in the background, it downloads the latest release from GitHub (plain HTTPS `GET`s, no identifiers). It installs it only if the installer is signed by the maintainer's key and the signed file is the version the release claims; an unsigned, re-signed, replayed, oversized or non-HTTPS release is refused before anything runs, and you are told once. Offline, nothing happens. Switch it off with `/model-profile auto-update-off` (or `CLAUDE_MODEL_PROFILE_NO_AUTO_UPDATE=1`). Details: [SECURITY.md](SECURITY.md).
 
 ## Troubleshooting
 
@@ -115,6 +119,11 @@ Nothing is sent over the network. The hooks make no network calls, run in an iso
 | `on` says "refusing to overwrite" a skill | You already have a skill named `deep-work` or `critical-work`. Rename yours and run `on` again |
 | "settings.json changed while it was being updated" | Another program saved your settings at the same moment. Nothing was overwritten; run the command again |
 | "do not run with sudo" | Run it as yourself |
+| "an update was not installed: …" | A release failed a safety check (unsigned, wrong signature, version mismatch, too large, not HTTPS, or a file you edited). Nothing was changed; your version keeps working. If it is a file you edited, run the installer with `--force` to keep your copy as a backup |
+| "… is a major update; it is not installed automatically" | Read the release notes, then `/model-profile update` |
+| `status` says `auto-update: inactive` | The update hook is missing from your settings. Run `/model-profile auto-update-on`, then restart |
+| "… was installed, but its hooks could not be registered" | Another program kept `settings.json` busy during the update. Run the one-file installer again |
+| The installer says "an automatic update is being installed right now" | Wait a minute and run it again |
 
 ## Honest limitations
 

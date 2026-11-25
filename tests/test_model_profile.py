@@ -261,6 +261,20 @@ class TestAutoOffHooks(SandboxTestCase):
                     self.assertEqual(found[0]["type"], "command")
                     self.assertGreater(found[0]["timeout"], 0)
 
+    def test_exactly_these_routing_hooks_are_registered(self) -> None:
+        self.run_cli("on")
+        hooks = self.read_settings()["hooks"]
+        ours = {
+            event: tuple(
+                hook["command"]
+                for group in hooks.get(event, [])
+                for hook in group["hooks"]
+                if "model-profile" in hook["command"]
+            )
+            for event in EXPECTED_HOOKS
+        }
+        self.assertEqual(ours, EXPECTED_HOOKS)
+
     def test_standards_hook_runs_once_per_conversation_not_on_every_prompt(
         self,
     ) -> None:

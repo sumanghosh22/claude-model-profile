@@ -21,20 +21,26 @@ from __future__ import annotations
 import copy
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess  # nosec B404 - runs git only, fixed argv, no shell
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 JsonObject = dict[str, Any]
 
@@ -81,6 +87,13 @@ PROMPT_START_COMMAND = (
 REVIEW_GATE_COMMAND = (
     'python3 -I "$HOME/.claude/bin/model-profile" review-gate 2>/dev/null || true'
 )
+# Not a routing hook: shareable builds keep updating while routing is off. It returns at once;
+# the daily check runs detached. Registered by the installer, removed on uninstall.
+AUTO_UPDATE_COMMAND = (
+    'python3 -I "$HOME/.claude/bin/model-profile" auto-update 2>/dev/null || true'
+)
+UPDATE_HOOK_EVENT = "SessionStart"
+UPDATE_COMMANDS = frozenset({AUTO_UPDATE_COMMAND})
 ROUTING_HOOKS: dict[str, tuple[str, ...]] = {
     "PostModelSwitch": (SYNC_COMMAND,),
     "SessionStart": (SYNC_COMMAND, CONTEXT_COMMAND),
@@ -181,7 +194,10 @@ TRIAGE_HINTS: dict[str, str] = {
     ),
 }
 # the gate runs git on the whole working tree, so it gets more time than the other hooks
-HOOK_TIMEOUTS: dict[str, int] = {REVIEW_GATE_COMMAND: 30, PROMPT_START_COMMAND: 20}
+HOOK_TIMEOUTS: dict[str, int] = {
+    REVIEW_GATE_COMMAND: 30,
+    PROMPT_START_COMMAND: 20,
+}
 REVIEW_DIR = PROFILE_DIR / "review"
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 REVIEW_STATE_MAX_AGE_SECONDS = 7 * 24 * 3600
@@ -373,6 +389,11 @@ USAGE = (
     "  model-profile prompt-start used by the Claude Code hook: auto-off, review snapshot, effort triage\n"
     "  model-profile review-gate  used by the Claude Code hook: requires an Opus review of changed files\n"
     "  model-profile statusline used by the Claude Code status line: prints a [ROUTING:ON|OFF] tag\n"
+    "  model-profile update     install the latest signed release now\n"
+    "  model-profile update-check  say whether a newer release exists\n"
+    "  model-profile auto-update-on|auto-update-off  daily automatic updates (shareable builds)\n"
+    "  model-profile auto-update  used by the Claude Code hook: starts the daily update check\n"
+    "  model-profile install-hooks|uninstall-hooks  used by the installer\n"
     "  model-profile version    show the installed version\n"
     "  model-profile help       show this help\n"
     "Inside Claude Code use `/model-profile on|off|status`.\n"
@@ -392,22 +413,46 @@ class BusyError(ProfileError):
     """Another model-profile run holds the lock."""
 
 
+class SettingsChangedError(ProfileError):
+    """settings.json was written by another program while this command was changing it."""
+
+
+LOCK_POLL_SECONDS = 0.05
+
+
 def warn(message: str) -> None:
     sys.stderr.write(f"model-profile: warning: {message}\n")
 
 
-@contextmanager
-def exclusive_lock() -> Iterator[None]:
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    with LOCK_FILE.open("a", encoding="utf-8") as handle:
+def acquire_flock(handle: IO[str], wait_seconds: float) -> bool:
+    """Take an exclusive lock, waiting at most `wait_seconds`; False if it stayed busy."""
+    give_up_at = time.monotonic() + wait_seconds
+    while True:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
         except BlockingIOError:
-            raise BusyError("another model-profile run is in progress") from None
+            if time.monotonic() >= give_up_at:
+                return False
+            time.sleep(LOCK_POLL_SECONDS)
+
+
+@contextmanager
+def held_lock(path: Path, busy_message: str, wait_seconds: float) -> Iterator[None]:
+    with path.open("a", encoding="utf-8") as handle:
+        if not acquire_flock(handle, wait_seconds):
+            raise BusyError(busy_message)
         try:
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+@contextmanager
+def exclusive_lock(wait_seconds: float = 0) -> Iterator[None]:
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    with held_lock(LOCK_FILE, "another model-profile run is in progress", wait_seconds):
+        yield
 
 
 def read_json_object(path: Path) -> JsonObject:
@@ -480,7 +525,7 @@ def write_settings_checked(payload: JsonObject, expected: SettingsSignature) -> 
     their change could be lost from "the whole command" to the instant before the swap.
     """
     if settings_signature() != expected:
-        raise ProfileError(
+        raise SettingsChangedError(
             "settings.json changed while it was being updated; run the command again"
         )
     write_json_atomic(SETTINGS_FILE, payload)
@@ -894,7 +939,7 @@ def repair() -> None:
         )
     signature = settings_signature()
     settings = read_settings()
-    repaired = add_routing_hooks({**settings, **PROFILE_SETTINGS})
+    repaired = refresh_installed_hooks({**settings, **PROFILE_SETTINGS})
     if repaired != settings:
         write_settings_checked(repaired, signature)
 
@@ -938,6 +983,7 @@ def describe_status() -> str:
             )
     else:
         lines.extend([MEANING_WHEN_OFF, NEXT_WHEN_OFF])
+    lines.append(describe_auto_update())
     return "\n".join(lines)
 
 
@@ -2086,6 +2132,732 @@ def run_status() -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------------------------------------
+# Automatic updates. Only installs that carry an update-channel file (the shareable builds)
+# update themselves, from the GitHub releases named in it, and only to a release whose installer
+# is signed by the key in that file: a hijacked GitHub account alone cannot push code to anyone.
+# The version is read from the signed bytes, so an old signed installer cannot be replayed as a
+# newer release to downgrade anyone or to slip a major version in.
+# ---------------------------------------------------------------------------------------------
+UPDATE_CHANNEL_FILE = PROFILE_DIR / "channel" / "update-channel.json"
+UPDATE_STATE_FILE = PROFILE_DIR / "update-state.json"
+UPDATE_LOCK_FILE = PROFILE_DIR / ".update.lock"
+UPDATE_STATE_LOCK_FILE = PROFILE_DIR / ".update-state.lock"
+UPDATE_DISABLE_ENV = "CLAUDE_MODEL_PROFILE_NO_AUTO_UPDATE"
+UPDATE_API_ENV = "CLAUDE_MODEL_PROFILE_UPDATE_API"
+DEFAULT_UPDATE_API = "https://api.github.com"
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+HTTPS_SCHEME = "https"
+LOOPBACK_SCHEME = "http"
+BACKGROUND_UPDATE_COMMAND = "auto-update-run"
+UPDATE_INTERVAL_SECONDS = 24 * 3600
+UPDATE_RUN_BUDGET_SECONDS = 240
+UPDATE_HTTP_TIMEOUT_SECONDS = 15
+UPDATE_INSTALL_TIMEOUT_SECONDS = 90
+UPDATE_SIGN_TIMEOUT_SECONDS = 30
+DOWNLOAD_CHUNK_BYTES = 64 * 1024
+MAX_RELEASE_JSON_BYTES = 1024 * 1024
+MAX_INSTALLER_BYTES = 5 * 1024 * 1024
+MAX_SIGNATURE_BYTES = 64 * 1024
+MAX_REPORTED_ERROR_CHARS = 200
+# install-hooks runs while sessions are open: their prompt hooks hold the profile lock briefly
+HOOKS_LOCK_WAIT_SECONDS = 10
+STATE_LOCK_WAIT_SECONDS = 5
+HOOK_STATE_LOCK_WAIT_SECONDS = 1
+UPDATER_ENV = "CLAUDE_MODEL_PROFILE_UPDATING"
+SIGNED_HEADER_BYTES = 4096
+SIGNATURE_IDENTITY = "claude-model-profile-release"
+SIGNATURE_NAMESPACE = "claude-model-profile-release"
+SIGNATURE_SUFFIX = ".sig"
+UPDATE_USER_AGENT = "claude-model-profile-updater"
+REPO_NAME_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$")
+ASSET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,100}\.sh$")
+SIGNER_KEY_PATTERN = re.compile(
+    r"^ssh-ed25519 [A-Za-z0-9+/]{68}(?: [A-Za-z0-9 ._@-]{0,80})?$"
+)
+RELEASE_VERSION_PATTERN = re.compile(r"^v?(\d{1,4})\.(\d{1,5})\.(\d{1,6})$")
+SIGNED_VERSION_PATTERN = re.compile(
+    rb"^# release-version: (\d{1,4}\.\d{1,5}\.\d{1,6})$", re.MULTILINE
+)
+KEYGEN_TOO_OLD = re.compile(r"(?:unknown|illegal|invalid) option", re.IGNORECASE)
+UPDATED = "updated"
+UP_TO_DATE = "up-to-date"
+UPDATE_AVAILABLE = "available"
+MAJOR_AVAILABLE = "major-available"
+UPDATE_SKIPPED = "skipped"
+NOTICE_STATUSES = frozenset({UPDATED, MAJOR_AVAILABLE})
+UPDATE_NOT_INSTALLED_PREFIX = "Claude Model Profile: an update was not installed: "
+# offline, rate-limited, cut short or out of time: tried again tomorrow, never shown to the user
+TRANSIENT_UPDATE_ERRORS: tuple[type[Exception], ...] = (
+    OSError,
+    ValueError,
+    http.client.HTTPException,
+    subprocess.TimeoutExpired,
+)
+BACKGROUND_UPDATE_ERRORS: tuple[type[Exception], ...] = (
+    ProfileError,
+    *TRANSIENT_UPDATE_ERRORS,
+)
+Version = tuple[int, int, int]
+
+
+class UpdateRefused(ProfileError):
+    """A release that must not be installed: unsigned, wrongly signed, too big, malformed."""
+
+    def __init__(self, message: str, release: str | None = None) -> None:
+        super().__init__(message)
+        self.release = release
+
+    def notice(self) -> str:
+        """One line for the user; names the release, so each new refusal is shown once."""
+        if self.release is None:
+            return f"{UPDATE_NOT_INSTALLED_PREFIX}{self}"
+        return f"Claude Model Profile {self.release} was not installed: {self}"
+
+
+@dataclass(frozen=True)
+class UpdateChannel:
+    repo: str
+    asset: str
+    signer: str
+
+
+@dataclass(frozen=True)
+class UpdateResult:
+    status: str
+    message: str = ""
+
+
+def load_update_channel() -> UpdateChannel | None:
+    """The release channel of a shareable build; None for installs that never self-update."""
+    if not UPDATE_CHANNEL_FILE.is_file():
+        return None
+    data = read_json_object(UPDATE_CHANNEL_FILE)
+    repo, asset, signer = data.get("repo"), data.get("asset"), data.get("signer")
+    if not (
+        isinstance(repo, str)
+        and REPO_NAME_PATTERN.fullmatch(repo)
+        and isinstance(asset, str)
+        and ASSET_NAME_PATTERN.fullmatch(asset)
+        and isinstance(signer, str)
+        and SIGNER_KEY_PATTERN.fullmatch(signer)
+    ):
+        raise ProfileError(f"invalid update channel file: {UPDATE_CHANNEL_FILE}")
+    return UpdateChannel(repo, asset, signer)
+
+
+def parse_release_version(text: object) -> Version | None:
+    match = RELEASE_VERSION_PATTERN.fullmatch(text) if isinstance(text, str) else None
+    if match is None:
+        return None
+    major, minor, patch = (int(part) for part in match.groups())
+    return major, minor, patch
+
+
+def version_text(version: Version) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def installed_release_version() -> Version | None:
+    try:
+        return parse_release_version(VERSION_FILE.read_text(encoding="utf-8").strip())
+    except OSError:
+        return None
+
+
+def signed_release_version(installer: bytes) -> Version | None:
+    """The version written into the installer's header, which the signature covers."""
+    match = SIGNED_VERSION_PATTERN.search(installer[:SIGNED_HEADER_BYTES])
+    return parse_release_version(match.group(1).decode("ascii")) if match else None
+
+
+def _url_parts_are(url: str, scheme: str, hosts: frozenset[str] | None) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+        user, password = parts.username, parts.password
+    except ValueError:
+        return False
+    return (
+        parts.scheme == scheme
+        and bool(host)
+        and (hosts is None or host in hosts)
+        and user is None
+        and password is None
+    )
+
+
+def is_https_url(url: str) -> bool:
+    return _url_parts_are(url, HTTPS_SCHEME, None)
+
+
+def is_loopback_http_url(url: str) -> bool:
+    return _url_parts_are(url, LOOPBACK_SCHEME, LOOPBACK_HOSTS)
+
+
+def is_allowed_update_url(url: object, base: str) -> bool:
+    """https anywhere; plain http only to this machine, and only when the API is local (tests)."""
+    return isinstance(url, str) and (
+        is_https_url(url) or (is_loopback_http_url(base) and is_loopback_http_url(url))
+    )
+
+
+def update_api_base() -> str:
+    """GitHub's API; the override exists only so tests can serve releases from this machine."""
+    override = os.environ.get(UPDATE_API_ENV)
+    if override is None:
+        return DEFAULT_UPDATE_API
+    if is_loopback_http_url(override):
+        return override.rstrip("/")
+    raise UpdateRefused(
+        f"{UPDATE_API_ENV} must be a test server on this machine "
+        "(http://127.0.0.1:<port>); remove it"
+    )
+
+
+class UpdateRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect (GitHub sends downloads to its file host) only to an allowed URL."""
+
+    def __init__(self, base: str) -> None:
+        super().__init__()
+        self.base = base
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: http.client.HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if not is_allowed_update_url(newurl, self.base):
+            raise UpdateRefused(
+                "a download was redirected to an address that is not https"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def seconds_left(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("the update ran out of time; it is tried again later")
+    return left
+
+
+def declared_length(headers: http.client.HTTPMessage) -> int | None:
+    value = headers.get("Content-Length")
+    return int(value) if isinstance(value, str) and value.isdigit() else None
+
+
+def download(url: object, base: str, limit: int, deadline: float) -> bytes:
+    """At most `limit` bytes over https, within the update's overall time budget."""
+    if not is_allowed_update_url(url, base):
+        raise UpdateRefused(
+            "the release points to a download address that is not https"
+        )
+    assert isinstance(url, str)  # nosec B101 - narrowed by is_allowed_update_url
+    opener = urllib.request.build_opener(UpdateRedirectHandler(base))
+    request = urllib.request.Request(url, headers={"User-Agent": UPDATE_USER_AGENT})
+    received = bytearray()
+    with opener.open(  # nosec B310 - https only (checked above and on every redirect)
+        request, timeout=min(UPDATE_HTTP_TIMEOUT_SECONDS, seconds_left(deadline))
+    ) as response:
+        expected = declared_length(response.headers)
+        if expected is not None and expected > limit:
+            raise UpdateRefused(f"a release file is larger than {limit} bytes")
+        # read1 returns after each network read, so a server trickling bytes meets the deadline
+        while chunk := response.read1(DOWNLOAD_CHUNK_BYTES):
+            received += chunk
+            if len(received) > limit:
+                raise UpdateRefused(f"a release file is larger than {limit} bytes")
+            seconds_left(deadline)
+    if expected is not None and expected != len(received):
+        raise ConnectionError("a download was cut short")
+    return bytes(received)
+
+
+def first_line(output: bytes) -> str:
+    text = output.decode("utf-8", errors="replace").strip()
+    return (text.splitlines() or ["unknown error"])[0][:MAX_REPORTED_ERROR_CHARS]
+
+
+def verify_release_signature(
+    installer: bytes, signature: bytes, signer: str, workdir: Path, deadline: float
+) -> bool:
+    """True only if `signature` is a valid signature of `installer` by the channel's key."""
+    keygen = shutil.which("ssh-keygen")
+    if keygen is None:
+        raise UpdateRefused(
+            "ssh-keygen is not installed, so the update cannot be verified"
+        )
+    allowed = workdir / "allowed_signers"
+    allowed.write_text(
+        f'{SIGNATURE_IDENTITY} namespaces="{SIGNATURE_NAMESPACE}" {signer}\n',
+        encoding="utf-8",
+    )
+    signature_file = workdir / "installer.sig"
+    signature_file.write_bytes(signature)
+    result = subprocess.run(  # nosec B603 - fixed argv, no shell
+        [
+            keygen,
+            "-Y",
+            "verify",
+            "-f",
+            str(allowed),
+            "-I",
+            SIGNATURE_IDENTITY,
+            "-n",
+            SIGNATURE_NAMESPACE,
+            "-s",
+            str(signature_file),
+        ],
+        input=installer,
+        capture_output=True,
+        timeout=min(UPDATE_SIGN_TIMEOUT_SECONDS, seconds_left(deadline)),
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    detail = first_line(result.stderr)
+    log_sync_event("warn", "update_signature_failed", detail=detail)
+    if KEYGEN_TOO_OLD.search(detail):
+        raise UpdateRefused(
+            "ssh-keygen on this machine is too old to check signatures "
+            "(OpenSSH 8.1 or newer is needed)"
+        )
+    return False
+
+
+@contextmanager
+def update_lock() -> Iterator[None]:
+    """One update at a time; a second session stands back instead of waiting.
+
+    The install folder is never created here: an update must not bring back a removed install.
+    """
+    with held_lock(UPDATE_LOCK_FILE, "another update is in progress", 0):
+        yield
+
+
+@contextmanager
+def update_state_lock(wait_seconds: float = STATE_LOCK_WAIT_SECONDS) -> Iterator[None]:
+    """Short read-modify-write of update-state.json; never held across network or install."""
+    with held_lock(UPDATE_STATE_LOCK_FILE, "the update state is busy", wait_seconds):
+        yield
+
+
+def read_update_state() -> JsonObject:
+    """The saved state; {} when there is none. A damaged file raises, so it is never
+    overwritten with defaults that would silently undo the user's `auto-update-off`."""
+    if not UPDATE_STATE_FILE.exists():
+        return {}
+    return read_json_object(UPDATE_STATE_FILE)
+
+
+def auto_updates_enabled(state: JsonObject) -> bool:
+    return not os.environ.get(UPDATE_DISABLE_ENV) and state.get("auto") is not False
+
+
+def automatic_check_skipped(state: JsonObject, now: float) -> str | None:
+    """Why an automatic check must not run now, or None when it is due."""
+    if not auto_updates_enabled(state):
+        return "automatic updates are off"
+    checked = state.get("checked_at")
+    if (
+        isinstance(checked, (int, float))
+        and not isinstance(checked, bool)
+        and 0 <= now - checked < UPDATE_INTERVAL_SECONDS
+    ):
+        return "checked recently"
+    return None
+
+
+def claim_update_check(now: float, force: bool) -> str | None:
+    """Record this attempt before any network use, unless another session just made one.
+
+    Recording first means an unreachable server is tried again tomorrow, not every session.
+    """
+    with update_state_lock():
+        state = read_update_state()
+        skipped = None if force else automatic_check_skipped(state, now)
+        if skipped is None:
+            write_json_atomic(UPDATE_STATE_FILE, {**state, "checked_at": now})
+    return skipped
+
+
+def fetch_latest_release(
+    channel: UpdateChannel, base: str, deadline: float
+) -> JsonObject:
+    raw = download(
+        f"{base}/repos/{channel.repo}/releases/latest",
+        base,
+        MAX_RELEASE_JSON_BYTES,
+        deadline,
+    )
+    try:
+        release = json.loads(raw)
+    except RecursionError as err:
+        raise ValueError("the release information is nested too deeply") from err
+    if not isinstance(release, dict):
+        raise UpdateRefused("the release information is malformed")
+    return release
+
+
+def release_assets(release: JsonObject) -> dict[str, object]:
+    raw_assets = release.get("assets")
+    return {
+        asset["name"]: asset.get("browser_download_url")
+        for asset in (raw_assets if isinstance(raw_assets, list) else [])
+        if isinstance(asset, dict) and isinstance(asset.get("name"), str)
+    }
+
+
+def install_release(
+    channel: UpdateChannel,
+    release: JsonObject,
+    latest: Version,
+    base: str,
+    deadline: float,
+) -> None:
+    """Download, verify the signature and the signed version, then run the installer."""
+    assets = release_assets(release)
+    signature_name = channel.asset + SIGNATURE_SUFFIX
+    if channel.asset not in assets or signature_name not in assets:
+        raise UpdateRefused("the release has no signed installer")
+    installer = download(assets[channel.asset], base, MAX_INSTALLER_BYTES, deadline)
+    signature = download(assets[signature_name], base, MAX_SIGNATURE_BYTES, deadline)
+    with tempfile.TemporaryDirectory(prefix="model-profile-update-") as tmp:
+        workdir = Path(tmp)
+        if not verify_release_signature(
+            installer, signature, channel.signer, workdir, deadline
+        ):
+            raise UpdateRefused(
+                "the installer's signature did not verify; not installed"
+            )
+        signed = signed_release_version(installer)
+        if signed != latest:
+            shown = version_text(signed) if signed else "unknown"
+            raise UpdateRefused(
+                f"the release is tagged {version_text(latest)} but its signed installer "
+                f"is version {shown}; not installed"
+            )
+        if seconds_left(deadline) < UPDATE_INSTALL_TIMEOUT_SECONDS:
+            raise TimeoutError("not enough time left to install; tried again later")
+        path = workdir / channel.asset
+        path.write_bytes(installer)
+        returncode, stderr = run_installer(path)
+    if returncode != 0:
+        raise UpdateRefused(f"the installer stopped: {first_line(stderr)}")
+
+
+def run_installer(path: Path) -> tuple[int, bytes]:
+    """Run the verified installer in its own process group; a timeout ends all of it."""
+    process = subprocess.Popen(  # nosec B603 B607 - runs the signature-verified installer
+        ["bash", str(path), "--friendly"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={**os.environ, UPDATER_ENV: "1"},
+        start_new_session=True,
+    )
+    try:
+        _, stderr = process.communicate(timeout=UPDATE_INSTALL_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise
+    return process.returncode, stderr
+
+
+def register_installed_hooks() -> None:
+    """Ask the just-installed version to register its hooks (its installer could not)."""
+    result = subprocess.run(  # nosec B603 - this script with a fixed argument, no shell
+        [sys.executable, "-I", str(Path(__file__).resolve()), "install-hooks"],
+        capture_output=True,
+        timeout=UPDATE_SIGN_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise UpdateRefused(
+            "it was installed, but its hooks could not be registered "
+            f"({first_line(result.stderr)}); run the installer again"
+        )
+
+
+def check_for_update(now: float, install: bool, force: bool) -> UpdateResult:
+    """One update check. `force` (a manual command) skips the daily limit and the off switch."""
+    channel = load_update_channel()
+    if channel is None:
+        return UpdateResult(UPDATE_SKIPPED, "this install does not update itself")
+    base = update_api_base()
+    deadline = time.monotonic() + UPDATE_RUN_BUDGET_SECONDS
+    with update_lock():
+        skipped = claim_update_check(now, force)
+        if skipped is not None:
+            return UpdateResult(UPDATE_SKIPPED, skipped)
+        release = fetch_latest_release(channel, base, deadline)
+        latest = parse_release_version(release.get("tag_name"))
+        if latest is None:
+            raise UpdateRefused("the latest release has no version number")
+        current = installed_release_version()
+        if current is None and not force:
+            raise UpdateRefused(
+                "the installed version is unknown; run the installer again to keep updating"
+            )
+        name = version_text(latest)
+        notes = f"https://github.com/{channel.repo}/releases/tag/v{name}"
+        if current is not None and latest <= current:
+            return UpdateResult(UP_TO_DATE, f"up to date ({version_text(current)})")
+        if current is not None and latest[0] > current[0] and not force:
+            return UpdateResult(
+                MAJOR_AVAILABLE,
+                f"Claude Model Profile {name} is a major update; it is not installed "
+                f"automatically. Run /model-profile update to install it. Notes: {notes}",
+            )
+        if not install:
+            return UpdateResult(
+                UPDATE_AVAILABLE,
+                f"{name} is available. Run /model-profile update. Notes: {notes}",
+            )
+        if load_update_channel() is None or not VERSION_FILE.is_file():
+            return UpdateResult(UPDATE_SKIPPED, "the tool was removed meanwhile")
+        try:
+            install_release(channel, release, latest, base, deadline)
+        except UpdateRefused as err:
+            if installed_release_version() != latest:
+                raise UpdateRefused(str(err), name) from err
+            # the files are in place; only the installer's last step (hooks) failed
+            try:
+                register_installed_hooks()
+            except UpdateRefused as hook_err:
+                raise UpdateRefused(str(hook_err), name) from err
+        if installed_release_version() != latest:
+            raise UpdateRefused(
+                "the installed version does not match the release", name
+            )
+        log_sync_event("info", "updated", version=name)
+        return UpdateResult(
+            UPDATED, f"Claude Model Profile updated to {name}. What changed: {notes}"
+        )
+
+
+def queue_notice(message: str) -> None:
+    """Shown at the next conversation start; each distinct message once, never daily."""
+    try:
+        with update_state_lock():
+            state = read_update_state()
+            if state.get("announced") == message:
+                return
+            write_json_atomic(
+                UPDATE_STATE_FILE, {**state, "announced": message, "pending": message}
+            )
+    except (ProfileError, OSError) as err:
+        log_sync_event(
+            "warn", "update_notice_lost", error=f"{type(err).__name__}: {err}"
+        )
+
+
+def take_pending_notice() -> str:
+    with update_state_lock(HOOK_STATE_LOCK_WAIT_SECONDS):
+        state = read_update_state()
+        if "pending" not in state:
+            return ""
+        pending = state["pending"]
+        write_json_atomic(
+            UPDATE_STATE_FILE,
+            {key: value for key, value in state.items() if key != "pending"},
+        )
+    return pending if isinstance(pending, str) else ""
+
+
+def start_background_update() -> None:
+    """The check runs detached, so a conversation never waits for the network or an install."""
+    subprocess.Popen(  # nosec B603 - this script with a fixed argument, no shell
+        [
+            sys.executable,
+            "-I",
+            str(Path(__file__).resolve()),
+            BACKGROUND_UPDATE_COMMAND,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=Path.home(),
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
+def run_auto_update() -> int:
+    """SessionStart hook: shows what the last background check found and starts the next."""
+    try:
+        if load_update_channel() is None:
+            return EXIT_OK
+        message = take_pending_notice()
+    except (ProfileError, OSError, ValueError) as err:
+        log_sync_event("warn", "update_failed", error=f"{type(err).__name__}: {err}")
+        return EXIT_OK
+    try:
+        now = datetime.now(timezone.utc).timestamp()
+        if automatic_check_skipped(read_update_state(), now) is None:
+            start_background_update()
+    except (ProfileError, OSError, ValueError, subprocess.SubprocessError) as err:
+        log_sync_event("warn", "update_failed", error=f"{type(err).__name__}: {err}")
+    if message:
+        sys.stdout.write(json.dumps({"systemMessage": message}) + "\n")
+    return EXIT_OK
+
+
+def run_background_update() -> int:
+    """The detached daily check: installs a signed release and queues one line for the user."""
+    try:
+        result = check_for_update(datetime.now(timezone.utc).timestamp(), True, False)
+        if result.status in NOTICE_STATUSES:
+            queue_notice(result.message)
+    except BusyError:
+        return EXIT_OK
+    except UpdateRefused as err:
+        log_sync_event("warn", "update_refused", release=err.release, error=str(err))
+        queue_notice(err.notice())
+    except BACKGROUND_UPDATE_ERRORS as err:
+        log_sync_event("warn", "update_failed", error=f"{type(err).__name__}: {err}")
+    return EXIT_OK
+
+
+def run_manual_update(install: bool) -> int:
+    """`update` / `update-check`: now, whatever the daily limit and the off switch say."""
+    try:
+        result = check_for_update(datetime.now(timezone.utc).timestamp(), install, True)
+    except TRANSIENT_UPDATE_ERRORS as err:
+        raise ProfileError(f"could not finish the update check: {err}") from err
+    sys.stdout.write(result.message + "\n")
+    return EXIT_OK
+
+
+def update_hook_installed(settings: JsonObject) -> bool:
+    try:
+        hooks = _hooks_section(settings)
+    except ProfileError:
+        return False
+    return any(
+        _group_has_command(group, AUTO_UPDATE_COMMAND)
+        for group in hooks.get(UPDATE_HOOK_EVENT, [])
+    )
+
+
+def with_update_hook(settings: JsonObject, wanted: bool) -> JsonObject:
+    """Settings with the daily update hook registered (or removed); unchanged if already so."""
+    if wanted and update_hook_installed(settings):
+        return settings
+    without = remove_routing_hooks(settings, UPDATE_COMMANDS)
+    if not wanted:
+        return without
+    hooks = copy.deepcopy(_hooks_section(without))
+    hooks.setdefault(UPDATE_HOOK_EVENT, []).append(
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": AUTO_UPDATE_COMMAND,
+                    "timeout": HOOK_TIMEOUT_SECONDS,
+                }
+            ]
+        }
+    )
+    return {**without, "hooks": hooks}
+
+
+def refresh_installed_hooks(settings: JsonObject) -> JsonObject:
+    """This version's hooks: the update hook for shareable builds, routing hooks while ON.
+
+    A damaged channel file leaves the update hook as it is, so `repair` still fixes routing.
+    """
+    try:
+        refreshed = with_update_hook(settings, load_update_channel() is not None)
+    except ProfileError as err:
+        log_sync_event("warn", "update_channel_damaged", error=str(err))
+        refreshed = settings
+    return add_routing_hooks(refreshed) if is_active() else refreshed
+
+
+def change_hooks(change: Callable[[JsonObject], JsonObject]) -> None:
+    """Apply `change` to settings.json under the profile lock; writes only a real change.
+
+    Runs unattended during updates, so it waits briefly for open sessions' hooks and tries
+    again once if Claude Code saved settings.json at the same instant.
+    """
+    with exclusive_lock(HOOKS_LOCK_WAIT_SECONDS):
+        try:
+            apply_settings_change(change)
+        except SettingsChangedError:
+            apply_settings_change(change)
+
+
+def apply_settings_change(change: Callable[[JsonObject], JsonObject]) -> None:
+    signature = settings_signature()
+    settings = read_settings()
+    changed = change(settings)
+    if changed != settings:
+        write_settings_checked(changed, signature)
+
+
+def run_install_hooks() -> int:
+    """Run by the installer after every install or update, so an upgrade needs no off/on."""
+    change_hooks(refresh_installed_hooks)
+    return EXIT_OK
+
+
+def run_uninstall_hooks() -> int:
+    """Run by the installer before it removes the files: drops the update hook."""
+    change_hooks(lambda settings: with_update_hook(settings, False))
+    return EXIT_OK
+
+
+def set_auto_update(enabled: bool) -> int:
+    """An explicit choice; it also resets a damaged state file."""
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    with update_state_lock():
+        try:
+            state = read_update_state()
+        except ProfileError:
+            state = {}
+        write_json_atomic(UPDATE_STATE_FILE, {**state, "auto": enabled})
+    if enabled and load_update_channel() is not None:
+        change_hooks(lambda settings: with_update_hook(settings, True))
+    sys.stdout.write(
+        "Automatic updates are on.\n" if enabled else "Automatic updates are off.\n"
+    )
+    return EXIT_OK
+
+
+def describe_auto_update() -> str:
+    try:
+        channel = load_update_channel()
+    except ProfileError:
+        return "auto-update: off (the update channel file is damaged; reinstall)"
+    if channel is None:
+        return "auto-update: not used by this install"
+    try:
+        state = read_update_state()
+    except ProfileError:
+        return (
+            "auto-update: off (the update state file is damaged; "
+            "`/model-profile auto-update-on` resets it)"
+        )
+    if not auto_updates_enabled(state):
+        return "auto-update: off (`/model-profile auto-update-on` to switch it on)"
+    try:
+        registered = update_hook_installed(read_settings())
+    except ProfileError:
+        registered = False
+    if not registered:
+        return (
+            "auto-update: inactive (run `/model-profile auto-update-on`, then restart)"
+        )
+    return f"auto-update: on, signed releases from github.com/{channel.repo}"
+
+
 def run_version() -> int:
     try:
         version = VERSION_FILE.read_text(encoding="utf-8").strip()
@@ -2124,6 +2896,14 @@ COMMANDS: dict[str, Callable[[], int]] = {
     "snapshot": run_snapshot,
     "prompt-start": run_prompt_start,
     "review-gate": run_review_gate,
+    "auto-update": run_auto_update,
+    BACKGROUND_UPDATE_COMMAND: run_background_update,
+    "update": lambda: run_manual_update(True),
+    "update-check": lambda: run_manual_update(False),
+    "install-hooks": run_install_hooks,
+    "uninstall-hooks": run_uninstall_hooks,
+    "auto-update-on": lambda: set_auto_update(True),
+    "auto-update-off": lambda: set_auto_update(False),
     "version": run_version,
     "--version": run_version,
     "help": run_help,

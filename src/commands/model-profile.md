@@ -1,6 +1,6 @@
 ---
 description: Switch cost-saving model routing on or off, or see its state
-argument-hint: [on | off | status | help]
+argument-hint: [on | off | status | update | help]
 disable-model-invocation: true
 allowed-tools: Bash(~/.claude/bin/model-profile:*)
 ---

@@ -1,0 +1,5 @@
+{
+  "repo": "sumanghosh22/claude-model-profile",
+  "asset": "install-claude-model-profile.sh",
+  "signer": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINFYoEs09QJBXqSP5gtMzT/dTJdwhUDdBR+mn0KrHOLy claude-model-profile-release"
+}

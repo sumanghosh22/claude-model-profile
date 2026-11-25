@@ -5,7 +5,9 @@ The result is one shell script with the whole package embedded. People download 
 run it. The build is reproducible: the same sources always produce the same bytes (fixed
 timestamps, sorted entries), so the printed SHA-256 can be verified.
 
-    build_bundle.py [--output-dir DIR]
+    build_bundle.py [--output-dir DIR] [--sign KEY]
+
+`--sign` writes <file>.sig with `ssh-keygen -Y sign`; installs verify it before they update.
 """
 
 from __future__ import annotations
@@ -15,6 +17,8 @@ import base64
 import gzip
 import hashlib
 import io
+import json
+import subprocess  # nosec B404 - runs ssh-keygen only
 import sys
 import tarfile
 from pathlib import Path
@@ -37,6 +41,9 @@ IGNORED_PARTS = {
 }
 IGNORED_SUFFIXES = (".pyc", ".bak")
 BUNDLE_NAME = "install-claude-model-profile.sh"
+CHANNEL_FILE = "src/channel/update-channel.json"
+SIGNATURE_NAMESPACE = "claude-model-profile-release"
+SIGNATURE_SUFFIX = ".sig"
 DEFAULT_ARGS = "--enable --friendly"
 FIXED_MTIME = 0
 BASE64_LINE_WIDTH = 76
@@ -45,6 +52,7 @@ EXECUTABLE_PARTS = ("src/bin/", "install.sh", "scripts/install.py")
 
 HEADER = r"""#!/usr/bin/env bash
 # Claude Model Profile @VERSION@ - single-file installer
+# release-version: @VERSION@
 #
 #   bash @NAME@              install and switch routing on
 #   bash @NAME@ status       what is installed
@@ -160,18 +168,71 @@ def build(output_dir: Path) -> tuple[Path, str]:
     return target, digest
 
 
+def release_asset_name() -> str:
+    """The installer file name that installs download; a release must be published under it."""
+    channel = json.loads((SOURCE_ROOT / CHANNEL_FILE).read_text(encoding="utf-8"))
+    asset = channel.get("asset") if isinstance(channel, dict) else None
+    if isinstance(asset, str) and asset:
+        return asset
+    raise ValueError(f"{CHANNEL_FILE} has no asset name")
+
+
+def sign(target: Path, key: Path) -> Path:
+    """Write <target>.sig with `ssh-keygen -Y sign`; installs verify it before updating.
+
+    Only a build named like the channel's asset is signed: a release under any other name would
+    never be found by the installs it is meant for.
+    """
+    expected = release_asset_name()
+    if target.name != expected:
+        raise ValueError(
+            f"only a release build is signed: {target.name} is not {expected} "
+            f"(the asset named in {CHANNEL_FILE})"
+        )
+    signature = target.with_name(target.name + SIGNATURE_SUFFIX)
+    signature.unlink(missing_ok=True)
+    result = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
+        [
+            "ssh-keygen",
+            "-Y",
+            "sign",
+            "-q",
+            "-f",
+            str(key),
+            "-n",
+            SIGNATURE_NAMESPACE,
+            str(target),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not signature.is_file():
+        raise ValueError(f"signing failed: {result.stderr.strip()}")
+    return signature
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Build the single-file installer.")
     parser.add_argument("--output-dir", type=Path, default=SOURCE_ROOT / "dist")
+    parser.add_argument(
+        "--sign",
+        type=Path,
+        metavar="KEY",
+        help="sign the result with this ssh ed25519 key (writes <file>.sig for auto-update)",
+    )
     args = parser.parse_args(argv[1:])
     try:
         target, digest = build(args.output_dir)
+        signature = sign(target, args.sign) if args.sign else None
     except (OSError, ValueError) as err:
         sys.stderr.write(f"build_bundle: {err}\n")
         return 1
     sys.stdout.write(
         f"Built {target} ({target.stat().st_size // 1024} KB)\nSHA-256 {digest}\n"
     )
+    if signature is not None:
+        sys.stdout.write(f"Signed {signature}\n")
     return 0
 
 
