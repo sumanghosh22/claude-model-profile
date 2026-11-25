@@ -5,3 +5,4 @@ Routing standards (active while model routing is on):
 - Testable, SOLID design.
 - Fix only what was asked, but at the highest standard.
 - Security by default: validate all inputs and external data, prevent injection and XSS, never hard-code secrets, and flag any vulnerability you notice.
+- Every final answer says what you verified and how, and what you did not verify. Never present something you inferred or assumed as fact.

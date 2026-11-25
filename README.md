@@ -70,11 +70,21 @@ Either way it installs and switches routing on. Then **restart Claude Code** and
 
 A question that only mentions billing or auth stays cheap. The check only suggests; Claude skips the skill if the task turns out to be simple.
 
+**Investigations get Opus, and the conversation remembers.** Reading evidence about a database or a production system ("why is this query slow", "find the solution", "rows examined", "check the prod db") is sized critical, because a misread number is the costliest mistake. And a conversation about hard work stays hard: short follow-ups carry no keywords of their own, so for the next 2 hours (up to 8 messages) a follow-up about the same subject keeps the level, while a generic one ("then what should I do?") drops one level. Closing words ("ok", "thanks") and long silences end it. Only the level, a few keywords and a counter are remembered, never your messages. The two effort skills also tell Claude to say where every number came from, mark what it inferred, and re-read raw logs and query plans before concluding.
+
 **A change cannot be finished until it is proven and reviewed.** When a task changed files, Claude is asked for three things, in one message:
 
 1. **A passing check.** A test, lint, type-check or build command must have run and passed *after the last edit*. Documentation-only changes are exempt.
 2. **An Opus review.** Small changes go to `code-reviewer` (Opus, medium effort); large or risky ones (auth, billing, payments, security, secrets, migrations, webhooks, over 150 lines or 8 files) go to `deep-reasoner` (Opus, high effort). A `CHANGES REQUIRED` verdict means fix and review again.
 3. **No secrets in new code.** The lines you added are scanned for real key formats (AWS, Stripe live, GitHub, GitLab, Slack, Google, Anthropic, OpenAI, private keys) and hard-coded passwords. Only file, line and kind are reported, never the value. Test fixtures are not flagged for passwords.
+
+**Every task is checked after it finishes, not only code changes.** When Claude stops, its final answer is compared with what actually ran in that turn:
+
+- It says tests or checks pass, but the last check of the turn **failed** → sent back once to fix it or say plainly that it fails. (Any task.)
+- In critical work it states facts about data or production (numbers over 999, rows, keys, tables, queries) while **no tool ran** and without saying "not verified" or "inferred" → sent back once to verify with a read-only tool or label it honestly.
+- It says "I verified / checked / ran…" or "tests pass" while no tool ran in that turn → a free **notice** to you ("treat it as unverified"), not a block, because answers often summarise work from earlier messages.
+
+Each message is sent back at most once, never in a loop, and the answer is never stored or logged. On two weeks of the author's real use: 4 send-backs and 14 notices across 670 tasks. A seventh default standard also asks every answer to say what was verified and how, and what was not.
 
 It never traps a session: after two requests it lets Claude finish and tells you what is still missing. Questions and explanations that change nothing are never checked, so they cost nothing extra. Expect the Opus review to add some token cost to every code change; that is the price of the safety net.
 
@@ -97,6 +107,8 @@ Nothing is sent over the network. The hooks make no network calls, run in an iso
 | `/model-profile` not found | Restart Claude Code after installing |
 | Status says ON but the conversation uses another model | A model chosen in that conversation wins. Type `/model opusplan` there, or open a new conversation |
 | Routing switched itself off | You picked a model with `/model`. `/model-profile on` switches it back on |
+| Claude says "evidence check" and answers again | Intended: the answer claimed tests pass after a failed check, or stated facts about data in critical work without running anything. It asks once per message. |
+| A notice says "no tool ran in this turn" | Claude claimed a check it did not run in that message. If it matters, ask it to run the check now. |
 | Claude keeps asking for an Opus review | Intended after a change; let it run. After two requests it stops asking and tells you the change is unreviewed |
 | Claude asks to run checks for a tiny change | Intended. If the project has no tests or lint, Claude says so and the request stops after two tries |
 | A "possible secret" is just a test value | Put fixtures under `tests/` or name them `*.example`, or tell Claude it is deliberate: you get one warning, then it is only reported |

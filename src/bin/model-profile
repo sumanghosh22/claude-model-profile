@@ -104,6 +104,7 @@ ACTION_WORDS = re.compile(
     r"\b(fix\w*|chang\w*|implement\w*|add\w*|updat\w*|remov\w*|delet\w*|writ\w*|"
     r"build\w*|refactor\w*|rewrit\w*|migrat\w*|deploy\w*|patch\w*|review\w*|audit\w*|"
     r"debug\w*|investigat\w*|harden\w*|creat\w*|modif\w*|optimi[sz]\w*|improv\w*|"
+    r"check\w*|verif\w*|analy[sz]\w*|diagnos\w*|inspect\w*|examin\w*|troubleshoot\w*|"
     r"speed up|make)\b",
     re.IGNORECASE,
 )
@@ -113,6 +114,19 @@ COMPLEX_SIGNALS = re.compile(
     r"rewrit\w*|migrat\w*|upgrad\w*|failing|fails|regression|flaky)\b",
     re.IGNORECASE,
 )
+DATA_TOPICS = re.compile(
+    r"\b(db|dbs|databases?|mongo\w*|postgres\w*|mysql|sql|redis|kafka|quer(?:y|ies)|"
+    r"collections?|tables?|index(?:es)?|indices|schemas?)\b",
+    re.IGNORECASE,
+)
+ANALYSIS_CUES = re.compile(
+    r"\b(slow\w*|faster|speed(?:ing)? up|latenc\w*|bottleneck\w*|query plans?|"
+    r"execution plans?|explain plans?|keys? ?examined|docs? ?examined|"
+    r"rows? (?:examined?|scanned)|(?:full|collection) scans?|profil(?:er|ing)|"
+    r"diagnos\w+|root cause|find the (?:cause|solution|reason|problem)|figure out why)\b",
+    re.IGNORECASE,
+)
+PRODUCTION_WORDS = frozenset({"production", "prod"})
 REPEATED_FAILURE = re.compile(
     r"\b(still (broken|failing|not working)|not working again|same (error|issue|problem)|"
     r"keeps? failing|tried (twice|again))\b",
@@ -121,6 +135,33 @@ REPEATED_FAILURE = re.compile(
 CODE_PATH = re.compile(
     r"[\w./-]+\.(?:py|ts|tsx|js|jsx|go|java|rb|php|cs|sql|ya?ml|tf|sh|kt|swift|rs)\b"
 )
+# A conversation about hard work stays hard: short follow-ups ("code was correct you mean?")
+# carry no keywords of their own but are answered with the same stakes.
+FOLLOWUP_WINDOW_SECONDS = 120 * 60
+FOLLOWUP_PROMPTS = 8
+OFF_TOPIC_FOLLOWUP_COST = 2
+# QUESTION words that, in the middle of hard work, are about the same subject: "what would be
+# the fix?". In an instruction ("fix the typo in the readme") they start a new task instead.
+QUESTION_FORM = re.compile(
+    r"\?|^\W*(?:what|why|how|which|where|when|who|is|are|does|do|did|can|could|should|"
+    r"would|will)\b",
+    re.IGNORECASE,
+)
+FOLLOWUP_SUBJECT = re.compile(
+    r"\b(fix\w*|solution|cause|reason|why|plan|risk|impact|rollback|roll\w* (?:\w+ )?back)\b",
+    re.IGNORECASE,
+)
+NUMBER_IN_TEXT = re.compile(r"\d{1,3}(?:,\d{3})+|\d{4,}")
+MIN_FOLLOWUP_CHARS = 12
+CLOSING_PHRASE = re.compile(
+    r"^(?:ok(?:ay)?|thanks?(?: you)?|thx|yes|yep|yeah|no|nope|done|great|cool|nice|"
+    r"perfect|good|fine|sure|right|correct|got it|understood|continue|go on|proceed|"
+    r"please)[\s.!?]*$",
+    re.IGNORECASE,
+)
+KEYWORD_PATTERN = re.compile(r"^[a-z0-9][a-z0-9 -]{0,40}$", re.IGNORECASE)
+TRIAGE_RANK = {"routine": 0, "complex": 1, "critical": 2}
+TRIAGE_RANKED = ("routine", "complex", "critical")
 COMPLEX_PROMPT_CHARS = 800
 MIN_PROMPT_CHARS_FOR_DESIGN_TALK = 200
 MULTI_FILE_THRESHOLD = 3
@@ -177,6 +218,66 @@ DEEP_REVIEWER = "deep-reasoner"
 REVIEWER_AGENTS = frozenset({STANDARD_REVIEWER, DEEP_REVIEWER})
 FILE_EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 CHANGES_REQUIRED_MARKER = "VERDICT: CHANGES REQUIRED"
+# the transcript of a long session can be over a gigabyte; a task is only its tail
+TURN_TAIL_START_BYTES = 2 * 1024 * 1024
+TURN_TAIL_GROWTH = 4
+TURN_TAIL_MAX_BYTES = 128 * 1024 * 1024
+# calling these says nothing about whether a claim was checked
+NON_EVIDENCE_TOOLS = frozenset(
+    {"Skill", "TodoWrite", "ExitPlanMode", "AskUserQuestion"}
+)
+EVIDENCE_TEXT_MAX_CHARS = 20_000
+EVIDENCE_BLOCKS_PER_TURN = 1
+DATA_FACT_NUMBER = re.compile(
+    r"\d{1,3}(?:,\d{3})+|\b\d{4,}\b|"
+    r"\b\d+(?:\.\d+)?\s?(?:ms|seconds?|%|docs?|documents|rows|keys|accounts|records|scans?)\b",
+    re.IGNORECASE,
+)
+UNVERIFIED_MARKER = re.compile(
+    r"not verified|unverified|inferred|not measured|"
+    r"i (?:have not|haven't) (?:checked|verified|read|run)|assum",
+    re.IGNORECASE,
+)
+EVIDENCE_DATA_ISSUE = (
+    "This is critical work and your answer states facts about data or production "
+    "(numbers, tables, queries) but you ran no tool in this turn. Verify each such claim "
+    "with a read-only tool call (read the actual log, query plan or code), or label it "
+    "plainly as 'not verified' or 'inferred' in your answer."
+)
+EVIDENCE_FAILED_CHECK_ISSUE = (
+    "You say tests or checks pass, but the last check command in this turn failed. Fix the "
+    "failure and run it again, or say plainly that it fails."
+)
+EVIDENCE_CLOSING = "Do not add filler or new unverified claims."
+CLAIM_NOTICE = (
+    "Model routing: this answer says something was verified or passes, but no tool ran in "
+    "this turn. Treat it as unverified, or ask Claude to run the check now."
+)
+# First-person verification, or tests/checks said to pass. Measured on 14 days of real work: too
+# noisy to block on (answers often summarise earlier turns), so these only produce a notice.
+VERIFY_CLAIM = re.compile(
+    r"\bi(?:'ve| have)? (?:just |now |also |already )?(?:verified|checked|tested|ran|run|"
+    r"executed|confirmed|validated|reproduced|queried|inspected)\b|"
+    r"\b(?:verified|confirmed|validated) (?:that|against|with|on)\b",
+    re.IGNORECASE,
+)
+PASS_CLAIM = re.compile(
+    r"\b(?:all |every )?(?:tests?|checks?|specs?|suite|build|lint|type ?check)\b[^.\n]{0,40}"
+    r"\b(?:pass(?:ed|es|ing)?|green|succe(?:ed|eded|eds|ssful(?:ly)?))\b|"
+    r"\b(?:no|zero|0) (?:errors?|failures?|failing tests?)\b|\b0 failed\b",
+    re.IGNORECASE,
+)
+PRIOR_WORK = re.compile(
+    r"\b(?:earlier|previously|above|last turn|a moment ago|already)\b", re.IGNORECASE
+)
+# words that make "the tests pass" a wish, an instruction or a condition rather than a claim
+CONDITIONAL_WORDS = re.compile(
+    r"\b(?:should|would|will|to make|ensure|until|if|when|so that|can|could|might|need|"
+    r"needs|make sure|after|before|once|unless|hope|want|wants)\b",
+    re.IGNORECASE,
+)
+CLAUSE_END = re.compile(r"[.!?;\n]")
+CLAIM_CONTEXT_CHARS = 200
 VERIFY_COMMAND_PATTERN = re.compile(
     r"\b(pytest|unittest|tox|nox|make\s+(test|tests|check|lint|build|ci|verify)|"
     r"(npm|pnpm|yarn|bun)\s+(run\s+)?(test|lint|build|typecheck|type-check|check|verify)|"
@@ -1123,12 +1224,21 @@ class TurnActivity:
     edited_files: list[str]
     reviews: list[ReviewCall]
     verified_after_last_edit: bool = False
+    tool_calls: int = 0
+    final_text: str = ""
+    last_check_ok: bool | None = None
+
+
+def _entry_content(entry: JsonObject) -> object:
+    """The message content of a transcript entry; None when the entry is not shaped as expected."""
+    message = entry.get("message")
+    return message.get("content") if isinstance(message, dict) else None
 
 
 def _is_real_prompt(entry: JsonObject) -> bool:
     if entry.get("type") != "user" or entry.get("isSidechain") or entry.get("isMeta"):
         return False
-    content = (entry.get("message") or {}).get("content")
+    content = _entry_content(entry)
     if isinstance(content, str):
         return True
     return isinstance(content, list) and not any(
@@ -1150,6 +1260,50 @@ def _result_text(block: JsonObject) -> str:
     return ""
 
 
+def _parse_transcript_lines(lines: list[bytes]) -> list[JsonObject]:
+    entries: list[JsonObject] = []
+    for raw in lines:
+        if len(raw) > TRANSCRIPT_LINE_MAX_CHARS:
+            continue
+        try:
+            entry = json.loads(raw)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+def read_turn_entries(path: Path) -> list[JsonObject]:
+    """Entries from the user's latest real prompt on, reading only the end of the file.
+
+    A long session's transcript can be over a gigabyte; reading all of it took 37 s and
+    7.7 GB. This reads backwards in growing steps, each byte read and parsed once, until it
+    holds a real prompt, the whole file, or TURN_TAIL_MAX_BYTES.
+    """
+    size = path.stat().st_size
+    start = size  # file offset where the bytes already read begin
+    cut_line = b""  # the first, possibly incomplete, line of what has been read so far
+    entries: list[JsonObject] = []
+    window = TURN_TAIL_START_BYTES
+    with path.open("rb") as handle:
+        while True:
+            target = max(0, size - min(window, TURN_TAIL_MAX_BYTES))
+            if target < start:
+                handle.seek(target)
+                lines = (handle.read(start - target) + cut_line).split(b"\n")
+                start = target
+                cut_line = lines.pop(0) if start > 0 else b""
+                entries = _parse_transcript_lines(lines) + entries
+            if (
+                start == 0
+                or size - start >= TURN_TAIL_MAX_BYTES
+                or any(_is_real_prompt(entry) for entry in entries)
+            ):
+                return entries
+            window *= TURN_TAIL_GROWTH
+
+
 def turn_activity(transcript_path: object) -> TurnActivity:
     """What happened since the user's latest prompt: file edits and reviewer calls."""
     empty = TurnActivity([], [], False)
@@ -1159,19 +1313,14 @@ def turn_activity(transcript_path: object) -> TurnActivity:
     try:
         if not path.resolve().is_relative_to((CLAUDE_DIR / "projects").resolve()):
             return empty
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        entries = read_turn_entries(path)
     except OSError:
         return empty
-    entries: list[JsonObject] = []
-    for line in lines:
-        if len(line) > TRANSCRIPT_LINE_MAX_CHARS:
-            continue
-        try:
-            entry = json.loads(line)
-        except (ValueError, RecursionError):
-            continue
-        if isinstance(entry, dict):
-            entries.append(entry)
+    return summarise_turn(entries)
+
+
+def summarise_turn(entries: list[JsonObject]) -> TurnActivity:
+    """Edits, checks, reviews, tool calls and the final answer of the latest task in `entries`."""
     start = (
         max((i for i, e in enumerate(entries) if _is_real_prompt(e)), default=-1) + 1
     )
@@ -1182,15 +1331,29 @@ def turn_activity(transcript_path: object) -> TurnActivity:
     check_results: list[tuple[int, bool]] = []
     last_edit_position = -1
     position = 0
+    tool_calls = 0
+    final_text = ""
     for entry in entries[start:]:
-        content = (entry.get("message") or {}).get("content")
+        content = _entry_content(entry)
         if not isinstance(content, list):
             continue
+        if entry.get("type") == "assistant":
+            text = " ".join(
+                block["text"]
+                for block in content
+                if isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            )
+            if text.strip():
+                final_text = text
         for block in content:
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "tool_use":
                 position += 1
+                if block.get("name") not in NON_EVIDENCE_TOOLS:
+                    tool_calls += 1
                 raw_input = block.get("input")
                 tool_input: JsonObject = (
                     raw_input if isinstance(raw_input, dict) else {}
@@ -1232,7 +1395,15 @@ def turn_activity(transcript_path: object) -> TurnActivity:
                 )
     later_checks = sorted(r for r in check_results if r[0] > last_edit_position)
     verified = bool(later_checks) and later_checks[-1][1]
-    return TurnActivity(sorted(set(edited)), reviews, verified)
+    last_check_ok = max(check_results)[1] if check_results else None
+    return TurnActivity(
+        sorted(set(edited)),
+        reviews,
+        verified,
+        tool_calls,
+        final_text[:EVIDENCE_TEXT_MAX_CHARS],
+        last_check_ok,
+    )
 
 
 def is_check_command(tool_name: object, tool_input: JsonObject) -> bool:
@@ -1445,7 +1616,9 @@ def give_up_notice(
     )
 
 
-def review_gate_decision(payload: JsonObject, now: float) -> JsonObject | None:
+def review_gate_decision(
+    payload: JsonObject, now: float, activity: TurnActivity | None = None
+) -> JsonObject | None:
     """The Stop-hook output: a block with instructions, a notice, or None to allow."""
     if not is_active():
         return None
@@ -1454,7 +1627,8 @@ def review_gate_decision(payload: JsonObject, now: float) -> JsonObject | None:
         return None
     state = read_json_object(state_path) if state_path.is_file() else {}
     before = TreeFingerprint.from_json(state.get("fingerprint"))
-    activity = turn_activity(payload.get("transcript_path"))
+    if activity is None:
+        activity = turn_activity(payload.get("transcript_path"))
     after = tree_fingerprint(before.root) if before is not None else None
     root: str | None = None
     if before is not None and after is not None:
@@ -1531,6 +1705,8 @@ def classify_prompt(text: object) -> tuple[str, list[str]]:
         return TRIAGE_ROUTINE, []
     critical = sorted({m.group(0).lower() for m in CRITICAL_TOPICS.finditer(text)})
     complex_hits = sorted({m.group(0).lower() for m in COMPLEX_SIGNALS.finditer(text)})
+    data = sorted({m.group(0).lower() for m in DATA_TOPICS.finditer(text)})
+    cues = sorted({m.group(0).lower() for m in ANALYSIS_CUES.finditer(text)})
     has_action = ACTION_WORDS.search(text) is not None
     repeated = REPEATED_FAILURE.search(text) is not None
     files = len({m.group(0) for m in CODE_PATH.finditer(text)})
@@ -1538,7 +1714,13 @@ def classify_prompt(text: object) -> tuple[str, list[str]]:
         return TRIAGE_CRITICAL, ["repeated failure", *critical][:TRIAGE_MAX_REASONS]
     if critical and (has_action or complex_hits):
         return TRIAGE_CRITICAL, critical[:TRIAGE_MAX_REASONS]
+    stakes = data or [word for word in critical if word in PRODUCTION_WORDS]
+    if cues and stakes:
+        # reading evidence about a database or production system: a misread costs the most
+        return TRIAGE_CRITICAL, [*cues[:2], *stakes[:1]][:TRIAGE_MAX_REASONS]
     long_prompt = len(text) > COMPLEX_PROMPT_CHARS
+    if cues:
+        return TRIAGE_COMPLEX, cues[:TRIAGE_MAX_REASONS]
     if (
         (complex_hits and (has_action or len(text) > MIN_PROMPT_CHARS_FOR_DESIGN_TALK))
         or files >= MULTI_FILE_THRESHOLD
@@ -1549,6 +1731,89 @@ def classify_prompt(text: object) -> tuple[str, list[str]]:
     return TRIAGE_ROUTINE, []
 
 
+def valid_followup_state(raw: object, now: float) -> JsonObject | None:
+    """The saved level of this conversation, if it is still fresh. The file is untrusted input."""
+    if not isinstance(raw, dict):
+        return None
+    level, at, left = raw.get("level"), raw.get("at"), raw.get("left")
+    reasons = raw.get("reasons")
+    if (
+        level not in (TRIAGE_COMPLEX, TRIAGE_CRITICAL)
+        or isinstance(at, bool)
+        or not isinstance(at, (int, float))
+        or isinstance(left, bool)
+        or not isinstance(left, int)
+        or left <= 0
+        or not 0 <= now - at <= FOLLOWUP_WINDOW_SECONDS
+        or not isinstance(reasons, list)
+    ):
+        return None
+    clean = [r for r in reasons if isinstance(r, str) and KEYWORD_PATTERN.fullmatch(r)]
+    return {
+        "level": level,
+        "reasons": clean[:TRIAGE_MAX_REASONS],
+        "at": at,
+        "left": left,
+    }
+
+
+def is_on_topic(text: str) -> bool:
+    """Does this follow-up talk about data, production, an analysis or a number?"""
+    if (
+        FOLLOWUP_SUBJECT.search(text) is not None
+        and QUESTION_FORM.search(text) is not None
+    ):
+        return True
+    return any(
+        pattern.search(text) is not None
+        for pattern in (
+            DATA_TOPICS,
+            CRITICAL_TOPICS,
+            ANALYSIS_CUES,
+            COMPLEX_SIGNALS,
+            NUMBER_IN_TEXT,
+        )
+    )
+
+
+def decide_triage(
+    text: object, prior: object, now: float
+) -> tuple[str, list[str], JsonObject | None]:
+    """The level for this message and the conversation state to save (keywords, never text)."""
+    level, reasons = classify_prompt(text)
+    previous = valid_followup_state(prior, now)
+    own_state: JsonObject = {
+        "level": level,
+        "reasons": reasons,
+        "at": now,
+        "left": FOLLOWUP_PROMPTS,
+    }
+    if previous is None:
+        return level, reasons, own_state if level != TRIAGE_ROUTINE else None
+    if TRIAGE_RANK[level] >= TRIAGE_RANK[previous["level"]]:
+        return level, reasons, own_state if level != TRIAGE_ROUTINE else None
+    stripped = text.strip() if isinstance(text, str) else ""
+    if len(stripped) < MIN_FOLLOWUP_CHARS or CLOSING_PHRASE.fullmatch(stripped):
+        return level, reasons, previous
+    on_topic = is_on_topic(stripped)
+    # a follow-up about the same subject keeps the stakes; a generic one drops a level and
+    # uses up the memory faster, so a long chat does not stay expensive for its whole length
+    inherited_level = (
+        previous["level"]
+        if on_topic
+        else TRIAGE_RANKED[TRIAGE_RANK[previous["level"]] - 1]
+    )
+    if inherited_level == TRIAGE_ROUTINE:
+        return level, reasons, {**previous, "at": now, "left": previous["left"] - 1}
+    inherited = [f"follow-up to {previous['level']} work", *previous["reasons"]]
+    cost = 1 if on_topic else OFF_TOPIC_FOLLOWUP_COST
+    return (
+        inherited_level,
+        inherited[:TRIAGE_MAX_REASONS],
+        {**previous, "at": now, "left": previous["left"] - cost},
+    )
+
+
 def triage_hint(level: str, reasons: list[str]) -> str | None:
     template = TRIAGE_HINTS.get(level)
     if template is None:
@@ -1556,13 +1821,31 @@ def triage_hint(level: str, reasons: list[str]) -> str | None:
     return template.format(reasons=", ".join(reasons))
 
 
-def take_snapshot(payload: JsonObject) -> None:
+def prior_followup_state(payload: JsonObject) -> object:
+    """What the previous message of this conversation was sized as, if recorded."""
+    state_path = review_state_path(payload.get("session_id"))
+    if state_path is None or not state_path.is_file():
+        return None
+    try:
+        return read_json_object(state_path).get("triage")
+    except ProfileError:
+        return None
+
+
+def take_snapshot(
+    payload: JsonObject, triage: JsonObject | None = None, level: str | None = None
+) -> None:
     """Remember the working tree as the task starts, for the review gate."""
     state_path = review_state_path(payload.get("session_id"))
     cwd = payload.get("cwd")
     if state_path is None or not isinstance(cwd, str):
         return
-    fingerprint = tree_fingerprint(cwd)
+    try:
+        fingerprint = tree_fingerprint(cwd)
+    except (OSError, ValueError) as err:
+        # still reset the per-message state, so this message is never judged by the last one
+        log_sync_event("warn", "snapshot_fingerprint_failed", error=str(err))
+        fingerprint = None
     now = datetime.now(timezone.utc).timestamp()
     REVIEW_DIR.mkdir(parents=True, exist_ok=True)
     write_json_atomic(
@@ -1570,7 +1853,10 @@ def take_snapshot(payload: JsonObject) -> None:
         {
             "fingerprint": fingerprint.to_json() if fingerprint else None,
             "blocks": 0,
+            "evidence_blocks": 0,
             "updated": now,
+            **({"turn_level": level} if level is not None else {}),
+            **({"triage": triage} if triage is not None else {}),
         },
     )
     prune_review_states(now)
@@ -1592,8 +1878,11 @@ def run_prompt_start() -> int:
         output["systemMessage"] = message
     try:
         if is_active():
-            take_snapshot(payload)
-            level, reasons = classify_prompt(payload.get("prompt"))
+            now = datetime.now(timezone.utc).timestamp()
+            level, reasons, saved = decide_triage(
+                payload.get("prompt"), prior_followup_state(payload), now
+            )
+            take_snapshot(payload, saved, level)
             hint = triage_hint(level, reasons)
             if hint is not None:
                 output["hookSpecificOutput"] = {
@@ -1618,14 +1907,120 @@ def run_snapshot() -> int:
     return EXIT_OK
 
 
+def asserts_pass(text: str) -> bool:
+    """The answer states that tests or checks pass (not a wish, instruction or condition)."""
+    for match in PASS_CLAIM.finditer(text):
+        before = text[max(0, match.start() - CLAIM_CONTEXT_CHARS) : match.start()]
+        boundaries = list(CLAUSE_END.finditer(before))
+        clause = (
+            before[boundaries[-1].end() :] if boundaries else before
+        ) + match.group(0)
+        if CONDITIONAL_WORDS.search(clause) is None:
+            return True
+    return False
+
+
+def asserts_verification(text: str) -> bool:
+    """The answer says it verified, ran or confirmed something, or that checks pass."""
+    if PRIOR_WORK.search(text) is not None:
+        return False
+    return VERIFY_CLAIM.search(text) is not None or asserts_pass(text)
+
+
+def evidence_issues(activity: TurnActivity, turn_level: object) -> list[str]:
+    """What is wrong between this turn's answer and what actually ran. Exact checks only."""
+    text = activity.final_text
+    issues: list[str] = []
+    if (
+        turn_level == TRIAGE_CRITICAL
+        and text
+        and not activity.tool_calls
+        and DATA_FACT_NUMBER.search(text) is not None
+        and DATA_TOPICS.search(text) is not None
+        and UNVERIFIED_MARKER.search(text) is None
+    ):
+        issues.append(EVIDENCE_DATA_ISSUE)
+    if activity.last_check_ok is False and asserts_pass(text):
+        issues.append(EVIDENCE_FAILED_CHECK_ISSUE)
+    return issues
+
+
+def evidence_gate_decision(
+    payload: JsonObject, now: float, activity: TurnActivity | None = None
+) -> JsonObject | None:
+    """Every task, after it ends: compare what the answer claims with what actually ran.
+
+    - Blocks once (never a loop) for an exact contradiction: tests said to pass although the
+      last check of the turn failed, or, in critical work, facts about data with no tool run.
+    - Only notifies when the answer says it verified something but no tool ran at all, because
+      real answers often summarise earlier turns.
+    Never reads the answer into a log or the state; fails open.
+    """
+    if not is_active():
+        return None
+    state_path = review_state_path(payload.get("session_id"))
+    if state_path is None or not state_path.is_file():
+        return None
+    state = read_json_object(state_path)
+    blocks = state.get("evidence_blocks", 0)
+    if isinstance(blocks, bool) or not isinstance(blocks, int) or blocks < 0:
+        return None
+    if activity is None:
+        activity = turn_activity(payload.get("transcript_path"))
+    issues = (
+        evidence_issues(activity, state.get("turn_level"))
+        if blocks < EVIDENCE_BLOCKS_PER_TURN
+        else []
+    )
+    if issues:
+        write_json_atomic(
+            state_path, {**state, "evidence_blocks": blocks + 1, "updated": now}
+        )
+        log_sync_event("info", "evidence_requested", issues=len(issues))
+        numbered = " ".join(f"{i}. {text}" for i, text in enumerate(issues, 1))
+        return {
+            "decision": "block",
+            "reason": f"Model routing evidence check: {numbered} {EVIDENCE_CLOSING}",
+        }
+    if (
+        blocks == 0
+        and state.get("claim_notice") is not True
+        and activity.final_text
+        and not activity.tool_calls
+        and asserts_verification(activity.final_text)
+    ):
+        write_json_atomic(state_path, {**state, "claim_notice": True, "updated": now})
+        log_sync_event("info", "claim_notice")
+        return {"systemMessage": CLAIM_NOTICE}
+    return None
+
+
 def run_review_gate() -> int:
     """Stop hook: require an Opus review of changed files. Fails open (never traps a session)."""
     try:
-        decision = review_gate_decision(
-            read_hook_payload(), datetime.now(timezone.utc).timestamp()
+        payload = read_hook_payload()
+        now = datetime.now(timezone.utc).timestamp()
+        if not is_active():
+            return EXIT_OK
+        activity = turn_activity(
+            payload.get("transcript_path")
+        )  # parsed once, used twice
+        decision = review_gate_decision(payload, now, activity)
+        if decision is None:
+            decision = evidence_gate_decision(payload, now, activity)
+    except (
+        ProfileError,
+        OSError,
+        ValueError,
+        RecursionError,
+        TypeError,
+        AttributeError,
+        KeyError,
+    ) as err:
+        # a hook must never break the session: unexpected transcript shapes fail open, logged
+        log_sync_event(
+            "error", "review_gate_failed", error=f"{type(err).__name__}: {err}"
         )
-    except (ProfileError, OSError, ValueError, RecursionError) as err:
-        log_sync_event("error", "review_gate_failed", error=str(err))
         return EXIT_OK
     if decision is not None:
         sys.stdout.write(json.dumps(decision) + "\n")

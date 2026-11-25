@@ -103,6 +103,274 @@ class TestClassifier(SandboxTestCase):
         self.assertIn("critical-work skill", self.hint("fix the payment refund flow"))
 
 
+# The investigation that went wrong on 2026-11-25: a production database slowdown, analysed
+# on Sonnet at medium effort because every short follow-up looked routine on its own.
+# (minutes since the first message, the real wording). The 35-minute gap before the
+# "500,249" question is real: it is what an earlier 30-minute memory missed.
+INCIDENT_MESSAGES = (
+    (0, "this query in which service has been used first tell me"),
+    (
+        9,
+        "how can i improve this so that its become faster just tell me first dont start changing",
+    ),
+    (42, "you have db access so just read and find the solution"),
+    (47, "code was correct you mean?"),
+    (68, "then what should i do then?"),
+    (
+        69,
+        "you do check the prod db access you have just check and tell me you know the read only right",
+    ),
+    (73, "then first dev can be fixed right"),
+    (74, "on which db ?"),
+    (76, "feedbacks on this dont any exisitng index?"),
+    (111, "500,249 this data in which table have?"),
+    (
+        113,
+        "500,249 rows examine that is my point from which tbales and in which enviroment?",
+    ),
+    (121, "what would be the fix?"),
+    (122, "the table you want to add the index what indexes are already have?"),
+    (125, "so now what i needs to be done tell me that"),
+    (129, "when this query does call on which api"),
+)
+INCIDENT_PROMPTS = tuple(text for _, text in INCIDENT_MESSAGES)
+INCIDENT_LEVELS = [
+    "routine",  # a plain lookup is not escalated
+    "complex",  # wants it faster
+    "critical",  # read the database and find the solution
+    "complex",  # "code was correct you mean?": generic follow-up, one level lower
+    "complex",  # "then what should i do then?"
+    "critical",  # check the prod db
+    "complex",  # "then first dev can be fixed right": not a question, one level lower
+    "critical",  # "on which db ?"
+    "critical",  # the index question
+    "critical",  # "500,249 this data in which table" - the answer that was wrong
+    "critical",  # "500,249 rows examine ..."
+    "critical",  # "what would be the fix?"
+    "critical",  # the indexes question
+    "routine",  # "so now what i needs to be done": the memory is used up by now
+    "routine",  # a plain lookup again
+]
+MINUTE = 60.0
+
+
+class TestInvestigationLanguage(SandboxTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.module = load_script(PROFILE_CLI, self.home, "model_profile_incident")
+
+    def level(self, text: str) -> str:
+        return self.module.classify_prompt(text)[0]
+
+    def test_reading_evidence_about_a_database_or_production_is_critical(self) -> None:
+        for text in (
+            "you have db access so just read and find the solution",
+            "why is the mongo query so slow, check the explain plan",
+            "500,249 keys examined on the subscriptions collection, find the cause",
+            "the prod api is slow, profile it",
+            "you do check the prod db access you have just check",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.level(text), "critical")
+
+    def test_wanting_something_faster_is_at_least_complex(self) -> None:
+        for text in (
+            "how can i improve this so that its become faster",
+            "why is the build so slow?",
+            "find out why the page takes forever, figure out why",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(self.level(text), ("complex", "critical"))
+
+    def test_plain_lookups_and_explanations_stay_cheap(self) -> None:
+        for text in (
+            "explain how auth works in this repo",
+            "this query in which service has been used first tell me",
+            "what does the users table store?",
+            "where is the database url configured?",
+            "check the git status",
+            "rename the table class",
+            "come on man model profile is on",
+            "100% confirm me",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.level(text), "routine")
+
+    def test_the_skill_descriptions_cover_investigation_questions(self) -> None:
+        text = (SKILLS_SOURCE / "critical-work" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("even if the message is only a question", text)
+        self.assertIn("query plans", text)
+
+
+class TestFollowUps(SandboxTestCase):
+    DIAGNOSIS = "you have db access so just read and find the solution"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.module = load_script(PROFILE_CLI, self.home, "model_profile_followups")
+        self.now = 1_000_000.0
+
+    def ask(self, text: str, state: object, minutes: float = 2) -> tuple:
+        self.now += minutes * MINUTE
+        return self.module.decide_triage(text, state, self.now)
+
+    def conversation(self, prompts: tuple[str, ...]) -> list[str]:
+        state: object = None
+        levels = []
+        for text in prompts:
+            level, _, state = self.ask(text, state)
+            levels.append(level)
+        return levels
+
+    def test_the_incident_with_its_real_timing_keeps_its_stakes_from_the_diagnosis_on(
+        self,
+    ) -> None:
+        state: object = None
+        levels = []
+        for minute, text in INCIDENT_MESSAGES:
+            level, _, state = self.module.decide_triage(
+                text, state, self.now + minute * MINUTE
+            )
+            levels.append(level)
+        self.assertEqual(levels, INCIDENT_LEVELS)
+
+    def test_the_same_conversation_typed_rapidly_gives_the_same_levels(self) -> None:
+        self.assertEqual(self.conversation(INCIDENT_PROMPTS), INCIDENT_LEVELS)
+
+    def test_a_follow_up_on_the_same_subject_says_what_it_inherited_from(self) -> None:
+        _, _, state = self.ask(self.DIAGNOSIS, None)
+        level, reasons, _ = self.ask("on which db ?", state)
+        self.assertEqual(level, "critical")
+        self.assertEqual(reasons[0], "follow-up to critical work")
+        self.assertIn("db", reasons)
+
+    def test_a_generic_follow_up_drops_one_level_and_burns_the_memory_faster(
+        self,
+    ) -> None:
+        _, _, state = self.ask(self.DIAGNOSIS, None)
+        level, _, after_generic = self.ask("code was correct you mean?", state)
+        self.assertEqual(level, "complex")
+        self.assertEqual(
+            after_generic["left"], state["left"] - self.module.OFF_TOPIC_FOLLOWUP_COST
+        )
+        _, _, after_topical = self.ask("and the index on that table?", state)
+        self.assertEqual(after_topical["left"], state["left"] - 1)
+        self.assertEqual(self.ask("what about the index?", state)[0], "critical")
+
+    def test_a_question_about_the_fix_keeps_the_level_a_new_instruction_does_not(
+        self,
+    ) -> None:
+        _, _, state = self.ask(self.DIAGNOSIS, None)
+        for text, expected in (
+            ("what would be the fix?", "critical"),
+            ("why is that?", "critical"),
+            ("How do we roll this back", "critical"),
+            ("fix the typo in the readme", "complex"),
+            ("add a test for it", "complex"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.ask(text, state)[0], expected)
+
+    def test_complex_work_is_not_inherited_by_generic_follow_ups(self) -> None:
+        _, _, state = self.ask("how can i improve this so that its become faster", None)
+        self.assertEqual(self.ask("then what should i do then?", state)[0], "routine")
+        self.assertEqual(self.ask("and the latency after that?", state)[0], "complex")
+
+    def test_big_numbers_count_as_evidence_but_small_ones_do_not(self) -> None:
+        _, _, state = self.ask(self.DIAGNOSIS, None)
+        self.assertEqual(
+            self.ask("500,249 comes from where exactly?", state)[0], "critical"
+        )
+        self.assertEqual(self.ask("100% confirm me about that", state)[0], "complex")
+
+    def test_closing_phrases_and_tiny_messages_do_not_inherit(self) -> None:
+        _, _, state = self.ask("fix the stripe webhook race condition", None)
+        for text in (
+            "ok",
+            "thanks!",
+            "Yes",
+            "go on",
+            "done",
+            "no",
+            "why?",
+            "thank you!!!!",
+            "understood!!!!!",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.ask(text, state)[0], "routine")
+
+    def test_the_memory_expires_after_a_quiet_spell(self) -> None:
+        _, _, state = self.ask("fix the stripe webhook race condition", None)
+        self.assertEqual(
+            self.ask("and what about the db?", state, minutes=119)[0], "critical"
+        )
+        self.assertEqual(
+            self.ask("and what about the db?", state, minutes=121)[0], "routine"
+        )
+
+    def test_the_memory_runs_out_after_a_number_of_follow_ups(self) -> None:
+        _, _, state = self.ask("fix the stripe webhook race condition", None)
+        levels = []
+        for _ in range(self.module.FOLLOWUP_PROMPTS + 2):
+            level, _, state = self.ask("and what about the other db then?", state)
+            levels.append(level)
+        self.assertEqual(
+            levels[: self.module.FOLLOWUP_PROMPTS],
+            ["critical"] * self.module.FOLLOWUP_PROMPTS,
+        )
+        self.assertEqual(levels[self.module.FOLLOWUP_PROMPTS :], ["routine", "routine"])
+
+    def test_a_milder_message_never_downgrades_the_conversation(self) -> None:
+        _, _, state = self.ask("how can i improve this so that its become faster", None)
+        level, _, state = self.ask(self.DIAGNOSIS, state)
+        self.assertEqual(level, "critical")
+        level, _, saved = self.ask("how can i make this faster", state)
+        self.assertEqual(level, "critical")
+        self.assertEqual(saved["level"], "critical")
+
+    def test_a_routine_conversation_is_never_escalated(self) -> None:
+        self.assertEqual(
+            set(
+                self.conversation(
+                    (
+                        "what does this function return?",
+                        "and the other one?",
+                        "ok then explain it again",
+                    )
+                )
+            ),
+            {"routine"},
+        )
+
+    def test_a_damaged_or_hostile_state_is_ignored(self) -> None:
+        for state in (
+            "critical",
+            {"level": "critical"},
+            {"level": "critical", "at": "now", "left": 3, "reasons": []},
+            {"level": "critical", "at": self.now, "left": 0, "reasons": []},
+            {"level": "critical", "at": self.now, "left": True, "reasons": []},
+            {"level": "ultra", "at": self.now, "left": 3, "reasons": []},
+            {"level": "critical", "at": self.now + 99999, "left": 3, "reasons": []},
+            {"level": "critical", "at": self.now, "left": 3, "reasons": "db"},
+        ):
+            with self.subTest(state=state):
+                self.assertEqual(
+                    self.ask("and what about the db?", state, minutes=0)[0], "routine"
+                )
+
+    def test_saved_keywords_are_sanitised(self) -> None:
+        state = {
+            "level": "critical",
+            "at": self.now,
+            "left": 3,
+            "reasons": ["db", "<script>alert(1)</script>", 5, "x" * 200],
+        }
+        _, reasons, _ = self.ask("and what about the db?", state, minutes=0)
+        self.assertEqual(reasons, ["follow-up to critical work", "db"])
+
+
 class PromptStartTestCase(SandboxTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -180,6 +448,65 @@ class TestPromptStartHook(PromptStartTestCase):
         started = time.monotonic()
         self.prompt_start("refactor the module")
         self.assertLess(time.monotonic() - started, PROMPT_START_SECONDS_LIMIT)
+
+
+class TestIncidentThroughTheRealHook(PromptStartTestCase):
+    def test_every_message_of_the_incident_gets_the_right_hint_across_separate_processes(
+        self,
+    ) -> None:
+        hints = []
+        for text in INCIDENT_PROMPTS:
+            output = self.prompt_start(text)
+            context = output.get("hookSpecificOutput", {}).get("additionalContext", "")
+            hints.append(
+                "critical-work"
+                if "critical-work skill" in context
+                else "deep-work"
+                if "deep-work skill" in context
+                else "none"
+            )
+        expected = {
+            "routine": "none",
+            "complex": "deep-work",
+            "critical": "critical-work",
+        }
+        self.assertEqual(hints, [expected[level] for level in INCIDENT_LEVELS])
+
+    def test_a_follow_up_hint_names_its_origin_and_closing_words_get_none(self) -> None:
+        self.prompt_start("you have db access so just read and find the solution")
+        follow = self.prompt_start("on which db ?")
+        self.assertIn(
+            "follow-up to critical work",
+            follow["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertEqual(self.prompt_start("thanks"), {})
+
+    def test_the_conversation_memory_is_per_session(self) -> None:
+        self.prompt_start("you have db access so just read and find the solution")
+        other = subprocess.run(
+            [sys.executable, "-I", str(PROFILE_CLI), "prompt-start"],
+            input=json.dumps(
+                {
+                    "session_id": "another",
+                    "cwd": str(self.repo),
+                    "prompt": "on which db ?",
+                }
+            ),
+            env={**os.environ, "HOME": str(self.home)},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(other.stdout.strip(), "")
+
+    def test_only_keywords_are_saved_never_the_message(self) -> None:
+        secret = "you have db access so just read and find the solution for customer ZEBRA-77"
+        self.prompt_start(secret)
+        saved = (self.claude_dir / "model-profile" / "review" / "s-1.json").read_text()
+        self.assertNotIn("ZEBRA", saved)
+        self.assertNotIn("customer", saved)
+        self.assertIn('"critical"', saved)
 
 
 class TestHookUpgrade(SandboxTestCase):
