@@ -23,11 +23,11 @@ EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_USAGE = 2
 EXPECTED_MODEL = "opusplan"
-EXPECTED_EFFORT = "medium"
+EXPECTED_EFFORT = "high"
 ALLOWED_AGENT_MODELS = {"haiku", "sonnet", "opus"}
 BASELINE_SETTINGS = {
     "env": {"PATH": "/usr/bin"},
-    "effortLevel": "high",
+    "effortLevel": "low",
     "model": "sonnet",
     "permissions": {"allow": ["Bash(ls:*)"]},
 }
@@ -161,7 +161,7 @@ class TestDriftAndRepair(SandboxTestCase):
 
     def test_repair_reapplies_routing_and_keeps_everything_else(self) -> None:
         self.run_cli("on")
-        self.write_settings({"env": {"A": "1"}, "effortLevel": "high", "theme": "dark"})
+        self.write_settings({"env": {"A": "1"}, "effortLevel": "low", "theme": "dark"})
         result = self.run_cli("repair")
         self.assertEqual(result.returncode, EXIT_OK, result.stderr)
         settings = self.read_settings()
@@ -234,8 +234,10 @@ STANDARDS_RULES = (
     "Testable, SOLID design.",
     "Fix only what was asked, but at the highest standard.",
     "Security by default: validate all inputs and external data, prevent injection and XSS, never hard-code secrets, and flag any vulnerability you notice.",
+    "Every final answer says what you verified and how, and what you did not verify.",
+    "Test every scenario, none skipped:",
 )
-MAX_STANDARDS_WORDS = 120
+MAX_STANDARDS_WORDS = 160
 USER_HOOKS = {
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "echo mine"}]}],
     "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "echo stop"}]}],
@@ -618,7 +620,7 @@ class TestSync(SandboxTestCase):
 
     def test_effort_changes_alone_do_not_switch_routing_off(self) -> None:
         self.run_cli("on")
-        self.write_settings({**self.read_settings(), "effortLevel": "high"})
+        self.write_settings({**self.read_settings(), "effortLevel": "low"})
         self.assertEqual(self.sync().stdout, "")
         self.assertTrue(self.state_path.exists())
         self.assertIn("effortLevel", self.run_cli("status").stdout.split("warning:")[1])
@@ -1185,7 +1187,7 @@ EXPECTED_ROLE_EFFORT = {
     "Explore": "low",
     "log-reader": "low",
     "deep-reasoner": "high",
-    "code-reviewer": "medium",
+    "code-reviewer": "high",
 }
 
 

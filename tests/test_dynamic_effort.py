@@ -610,7 +610,7 @@ class TestSkillsInstall(SandboxTestCase):
     def test_status_explains_the_effort_ladder(self) -> None:
         self.run_cli("on")
         out = self.run_cli("status").stdout
-        self.assertIn("medium by default", out)
+        self.assertIn("high by default", out)
         self.assertIn("deep-work", out)
         self.assertIn("critical-work skill (Opus, high)", out)
 

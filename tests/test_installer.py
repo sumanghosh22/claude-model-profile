@@ -20,7 +20,7 @@ from paths import ROOT
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_USAGE = 2
-BASELINE_SETTINGS = {"env": {"A": "1"}, "model": "sonnet", "effortLevel": "high"}
+BASELINE_SETTINGS = {"env": {"A": "1"}, "model": "sonnet", "effortLevel": "low"}
 EXPECTED_BIN = {"model-profile"}
 EXPECTED_COMMANDS = {"model-profile.md", "complex.md"}
 EXPECTED_AGENTS = {
@@ -151,7 +151,7 @@ class TestInstall(InstallerTestCase):
         self.assertEqual(result.returncode, EXIT_OK, result.stderr)
         settings = json.loads(self.settings.read_text())
         self.assertEqual(
-            (settings["model"], settings["effortLevel"]), ("opusplan", "medium")
+            (settings["model"], settings["effortLevel"]), ("opusplan", "high")
         )
         self.assertEqual(
             {p.name for p in self.installed("agents").iterdir()}, EXPECTED_AGENTS
@@ -429,6 +429,275 @@ class TestUsage(InstallerTestCase):
         )
         self.assertEqual(result.returncode, EXIT_OK, result.stderr)
         self.assertIn("not installed", result.stdout)
+
+
+class TestUpgradeRefreshesAgentsAndSkills(InstallerTestCase):
+    """An upgrade gives the copies in ~/.claude/agents and ~/.claude/skills this version's
+    content while routing is on, without ever touching a copy you edited or deleted."""
+
+    REVIEWER = "agents/code-reviewer.md"
+    DEEP_WORK = "skills/deep-work/SKILL.md"
+
+    def setUp(self) -> None:
+        super().setUp()
+        result = self.run_installer("--enable")
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+
+    def state(self) -> dict:
+        return json.loads(self.installed("model-profile/state.json").read_text())
+
+    def change_source(self, relative: str, extra: str) -> None:
+        path = self.repo / "src" / relative
+        path.write_text(path.read_text(encoding="utf-8") + extra, encoding="utf-8")
+
+    def upgrade(self) -> None:
+        result = self.run_installer()
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+
+    def run_profile(self, action: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-I", str(self.installed("bin/model-profile")), action],
+            env={**os.environ, "HOME": str(self.home)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_a_changed_agent_reaches_an_unedited_copy_and_is_recorded(self) -> None:
+        self.change_source(self.REVIEWER, "\nNew review rule.\n")
+        self.upgrade()
+        copy = self.installed(self.REVIEWER)
+        self.assertIn("New review rule.", copy.read_text())
+        self.assertEqual(
+            self.state()["installed_agents"]["code-reviewer.md"], sha256(copy)
+        )
+        self.assertEqual(self.run_profile("off").returncode, EXIT_OK)
+        self.assertFalse(copy.exists(), "off still removes the refreshed copy")
+
+    def test_a_changed_skill_reaches_an_unedited_copy(self) -> None:
+        self.change_source(self.DEEP_WORK, "\nNew skill rule.\n")
+        self.upgrade()
+        copy = self.installed(self.DEEP_WORK)
+        self.assertIn("New skill rule.", copy.read_text())
+        self.assertEqual(self.state()["installed_skills"]["deep-work"], sha256(copy))
+
+    def test_a_copy_you_edited_is_never_overwritten(self) -> None:
+        copy = self.installed(self.REVIEWER)
+        copy.write_text("my own reviewer", encoding="utf-8")
+        recorded = self.state()["installed_agents"]["code-reviewer.md"]
+        self.change_source(self.REVIEWER, "\nNew review rule.\n")
+        self.upgrade()
+        self.assertEqual(copy.read_text(), "my own reviewer")
+        self.assertEqual(self.state()["installed_agents"]["code-reviewer.md"], recorded)
+        self.assertEqual(self.run_profile("off").returncode, EXIT_OK)
+        self.assertEqual(copy.read_text(), "my own reviewer", "off keeps it too")
+
+    def test_a_copy_replaced_by_a_link_is_left_alone(self) -> None:
+        copy = self.installed(self.REVIEWER)
+        target = self.home / "elsewhere.md"
+        target.write_text("linked", encoding="utf-8")
+        copy.unlink()
+        copy.symlink_to(target)
+        self.change_source(self.REVIEWER, "\nNew review rule.\n")
+        self.upgrade()
+        self.assertTrue(copy.is_symlink())
+        self.assertEqual(target.read_text(), "linked")
+
+    def test_a_copy_you_deleted_stays_deleted_across_upgrades(self) -> None:
+        self.installed(self.REVIEWER).unlink()
+        self.change_source(self.REVIEWER, "\nNew review rule.\n")
+        for _ in range(2):
+            self.upgrade()
+            self.assertFalse(self.installed(self.REVIEWER).exists())
+            self.assertIn("code-reviewer.md", self.state()["installed_agents"])
+        self.assertEqual(self.run_profile("off").returncode, EXIT_OK)
+
+    def test_a_folder_in_place_of_a_copy_is_left_alone(self) -> None:
+        copy = self.installed(self.REVIEWER)
+        copy.unlink()
+        copy.mkdir()
+        self.change_source(self.REVIEWER, "\nNew review rule.\n")
+        self.upgrade()
+        self.assertTrue(copy.is_dir())
+
+    def test_an_unreadable_copy_is_skipped_and_the_install_succeeds(self) -> None:
+        copy = self.installed(self.REVIEWER)
+        copy.chmod(0)
+        self.addCleanup(copy.chmod, 0o600)
+        self.change_source(self.REVIEWER, "\nNew review rule.\n")
+        self.upgrade()
+        copy.chmod(0o600)
+        self.assertNotIn("New review rule.", copy.read_text())
+
+    def test_a_refresh_stopped_before_recording_is_repaired(self) -> None:
+        self.change_source(self.REVIEWER, "\nNew review rule.\n")
+        copy = self.installed(self.REVIEWER)
+        copy.write_text((self.repo / "src" / self.REVIEWER).read_text())  # new content
+        self.upgrade()  # state still holds the old hash
+        self.assertEqual(
+            self.state()["installed_agents"]["code-reviewer.md"], sha256(copy)
+        )
+        self.assertEqual(self.run_profile("off").returncode, EXIT_OK)
+        self.assertFalse(copy.exists(), "off removes it, not 'modified since install'")
+
+    def test_a_damaged_state_file_still_gets_the_hooks_and_says_what_failed(
+        self,
+    ) -> None:
+        settings = json.loads(self.settings.read_text())
+        del settings["hooks"]["Stop"]
+        self.settings.write_text(json.dumps(settings))
+        self.installed("model-profile/state.json").write_text("{damaged")
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, EXIT_OK)
+        self.assertIn("agents and skills were not refreshed", result.stderr)
+        self.assertIn("Stop", json.loads(self.settings.read_text())["hooks"])
+
+    def test_a_skills_folder_the_refresh_creates_is_removed_by_off(self) -> None:
+        state = self.state()
+        shutil.rmtree(self.installed("skills"))
+        self.installed("model-profile/state.json").write_text(
+            json.dumps({**state, "installed_skills": {}, "created_skills_dir": False})
+        )
+        self.upgrade()
+        self.assertTrue(self.installed("skills/deep-work/SKILL.md").is_file())
+        self.assertTrue(self.state()["created_skills_dir"])
+        self.assertEqual(self.run_profile("off").returncode, EXIT_OK)
+        self.assertFalse(self.installed("skills").exists())
+
+    def test_a_new_agent_is_added_and_removed_again_by_off(self) -> None:
+        source = self.repo / "src" / "agents" / "test-designer.md"
+        source.write_text(
+            (self.repo / "src" / self.REVIEWER)
+            .read_text()
+            .replace("name: code-reviewer", "name: test-designer"),
+            encoding="utf-8",
+        )
+        self.upgrade()
+        copy = self.installed("agents/test-designer.md")
+        self.assertTrue(copy.is_file())
+        self.assertEqual(
+            self.state()["installed_agents"]["test-designer.md"], sha256(copy)
+        )
+        self.assertEqual(self.run_profile("off").returncode, EXIT_OK)
+        self.assertFalse(copy.exists())
+
+    def test_a_new_agent_never_overwrites_a_file_of_yours_with_its_name(self) -> None:
+        mine = self.installed("agents/test-designer.md")
+        mine.write_text("mine", encoding="utf-8")
+        (self.repo / "src" / "agents" / "test-designer.md").write_text(
+            "shipped", encoding="utf-8"
+        )
+        self.upgrade()
+        self.assertEqual(mine.read_text(), "mine")
+        self.assertNotIn("test-designer.md", self.state()["installed_agents"])
+
+    def test_a_new_skill_never_enters_a_folder_of_yours_with_its_name(self) -> None:
+        mine = self.installed("skills/careful-work")
+        mine.mkdir()
+        (mine / "notes.txt").write_text("mine", encoding="utf-8")
+        shipped = self.repo / "src" / "skills" / "careful-work"
+        shipped.mkdir()
+        (shipped / "SKILL.md").write_text(
+            "---\nname: careful-work\n---\nbody\n", encoding="utf-8"
+        )
+        self.upgrade()
+        self.assertFalse((mine / "SKILL.md").exists())
+        self.assertNotIn("careful-work", self.state()["installed_skills"])
+
+    def test_a_new_skill_is_added(self) -> None:
+        shipped = self.repo / "src" / "skills" / "careful-work"
+        shipped.mkdir()
+        (shipped / "SKILL.md").write_text(
+            "---\nname: careful-work\n---\nbody\n", encoding="utf-8"
+        )
+        self.upgrade()
+        copy = self.installed("skills/careful-work/SKILL.md")
+        self.assertEqual(copy.read_text(), "---\nname: careful-work\n---\nbody\n")
+        self.assertEqual(self.state()["installed_skills"]["careful-work"], sha256(copy))
+
+    def test_an_agent_no_longer_shipped_is_removed(self) -> None:
+        (self.repo / "src" / "agents" / "log-reader.md").unlink()
+        self.upgrade()
+        self.assertFalse(self.installed("agents/log-reader.md").exists())
+        self.assertTrue(self.installed("agents").is_dir(), "the shared folder stays")
+        self.assertNotIn("log-reader.md", self.state()["installed_agents"])
+
+    def test_a_skill_no_longer_shipped_is_removed_with_its_folder(self) -> None:
+        shutil.rmtree(self.repo / "src" / "skills" / "deep-work")
+        self.upgrade()
+        self.assertFalse(self.installed("skills/deep-work").exists())
+        self.assertNotIn("deep-work", self.state()["installed_skills"])
+
+    def test_nothing_changed_means_nothing_is_written(self) -> None:
+        state = self.installed("model-profile/state.json")
+        before = (state.stat().st_mtime_ns, sha256(self.installed(self.REVIEWER)))
+        self.upgrade()
+        self.assertEqual(
+            (state.stat().st_mtime_ns, sha256(self.installed(self.REVIEWER))), before
+        )
+
+    def test_routing_off_means_no_copies_are_made(self) -> None:
+        self.assertEqual(self.run_profile("off").returncode, EXIT_OK)
+        self.change_source(self.REVIEWER, "\nNew review rule.\n")
+        self.upgrade()
+        self.assertFalse(self.installed(self.REVIEWER).exists())
+        self.assertFalse(self.installed("model-profile/state.json").exists())
+
+    def test_the_shipped_reviewers_demand_a_test_for_every_scenario(self) -> None:
+        for name in ("code-reviewer", "deep-reasoner"):
+            with self.subTest(agent=name):
+                text = self.installed(f"agents/{name}.md").read_text()
+                self.assertIn("scenario coverage is mandatory", text.lower())
+                self.assertIn("`NO TEST`", text)
+                self.assertIn("effort: high", text)
+
+
+class TestUpgradeMovesEarlierDefaults(InstallerTestCase):
+    """Earlier versions set effort `medium` while ON; an upgrade moves exactly that value."""
+
+    def settings_now(self) -> dict:
+        return json.loads(self.settings.read_text())
+
+    def write_settings(self, **changes: object) -> None:
+        self.settings.write_text(json.dumps({**self.settings_now(), **changes}))
+
+    def run_profile(self, action: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-I", str(self.installed("bin/model-profile")), action],
+            env={**os.environ, "HOME": str(self.home)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_the_old_default_becomes_high_and_off_restores_your_own(self) -> None:
+        self.write_settings(effortLevel="low")
+        self.assertEqual(self.run_installer("--enable").returncode, EXIT_OK)
+        self.write_settings(effortLevel="medium")  # as left by 1.11 or earlier
+        self.assertEqual(self.run_installer().returncode, EXIT_OK)
+        self.assertEqual(self.settings_now()["effortLevel"], "high")
+        self.assertNotIn("warning:", self.run_profile("status").stdout)
+        off = self.run_profile("off")
+        self.assertEqual(off.returncode, EXIT_OK, off.stderr)
+        self.assertNotIn("keeping your value", off.stderr)
+        self.assertEqual(self.settings_now()["effortLevel"], "low")
+
+    def test_an_effort_you_chose_while_on_is_kept(self) -> None:
+        self.assertEqual(self.run_installer("--enable").returncode, EXIT_OK)
+        self.write_settings(effortLevel="xhigh")
+        self.assertEqual(self.run_installer().returncode, EXIT_OK)
+        self.assertEqual(self.settings_now()["effortLevel"], "xhigh")
+
+    def test_nothing_changes_while_routing_is_off(self) -> None:
+        self.write_settings(effortLevel="medium")
+        self.assertEqual(self.run_installer().returncode, EXIT_OK)
+        self.assertEqual(self.settings_now()["effortLevel"], "medium")
+
+    def test_repair_also_sets_high(self) -> None:
+        self.assertEqual(self.run_installer("--enable").returncode, EXIT_OK)
+        self.write_settings(effortLevel="medium")
+        self.assertEqual(self.run_profile("repair").returncode, EXIT_OK)
+        self.assertEqual(self.settings_now()["effortLevel"], "high")
 
 
 if __name__ == "__main__":

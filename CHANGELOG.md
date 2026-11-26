@@ -2,6 +2,16 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Versioning: [SemVer](https://semver.org/).
 
+## [1.12.0] - 2026-11-26
+
+### Changed
+- **Every finished change is reviewed by Opus at high effort.** `code-reviewer` moved from medium to high effort (and up to 30 turns); `deep-reasoner` already ran at high.
+- **Everyday work runs at high effort.** The profile's default effort moved from medium to high, so code is written with more thought, not only reviewed with it. Installs upgraded while routing is on move the old `medium` to `high` (a value you chose yourself is kept), and `off` still restores what you had before routing. Costs more tokens and replies take longer.
+- **Every scenario must have a test.** Both reviewers now list every scenario the change can meet (the normal path, boundaries, invalid or hostile input, every failure path, repeated or concurrent calls, security and authorisation, backward compatibility, a regression test per fixed bug) with the test that covers it. Any scenario without a test is a major finding, so the review gate sends the change back until it has one. The gate's request says so, and an eighth default standard asks for it in every task.
+
+### Fixed
+- **Upgrades now reach the helper agents and skills.** Their copies in `~/.claude/agents` and `~/.claude/skills` were made only by `on`, so an update (automatic or by hand) never changed them until routing was switched off and on. The installer now refreshes them while routing is on: unedited copies get the new content, new files are added where nothing of yours has the name, files no longer shipped are removed; a copy you edited, linked, made unreadable or deleted is never touched (and a deleted one never comes back). A refresh cut off midway repairs itself on the next install; if the refresh cannot run at all, the hooks are still registered and the failure is reported. An independent Opus review found 2 major and 4 minor problems in the first version; all are fixed. 19 tests cover each case, and each of the 12 guards was removed in turn to confirm a test fails.
+
 ## [1.11.0] - 2026-11-25
 
 ### Added

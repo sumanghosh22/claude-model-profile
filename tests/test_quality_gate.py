@@ -74,6 +74,8 @@ class TestEvidenceGate(ReviewGateTestCase):
         reason = self.reason()
         self.assertIn("1. No passing test", reason)
         self.assertIn("2. An Opus review is required", reason)
+        self.assertIn("The reviewer checks every scenario for a test", reason)
+        self.assertIn("marks as a major finding", reason)
 
     def test_docs_only_changes_need_no_check_run(self) -> None:
         self.git("checkout", "--", "app.py")

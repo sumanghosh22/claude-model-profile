@@ -3,7 +3,7 @@
 
 on      install the routed subagents (Haiku: Explore, log-reader; Opus: deep-reasoner)
         and set the default model to `opusplan` (Opus plans, Sonnet executes) at
-        effort `medium`
+        effort `high`
 off     remove exactly what `on` installed and restore the previous model/effort
 status  show whether the profile is active
 
@@ -37,7 +37,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Any
@@ -59,7 +59,10 @@ SKILL_FILE = "SKILL.md"
 SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 SYNC_LOG = PROFILE_DIR / "sync.log"
 
-PROFILE_SETTINGS: JsonObject = {"model": "opusplan", "effortLevel": "medium"}
+PROFILE_SETTINGS: JsonObject = {"model": "opusplan", "effortLevel": "high"}
+# What earlier versions set while ON. An upgrade moves exactly these values to the current
+# ones; anything else in those keys was chosen by the user and is kept.
+EARLIER_PROFILE_SETTINGS: JsonObject = {"effortLevel": "medium"}
 AGENT_SUFFIX = ".md"
 # Claude Code hook events that run `sync`: right after a model switch, when a session starts,
 # and on every prompt (a safety net in case a switch is made some other way).
@@ -232,6 +235,11 @@ RISKY_PATH_PATTERN = re.compile(
 STANDARD_REVIEWER = "code-reviewer"
 DEEP_REVIEWER = "deep-reasoner"
 REVIEWER_AGENTS = frozenset({STANDARD_REVIEWER, DEEP_REVIEWER})
+SCENARIO_REVIEW_NOTE = (
+    "normal path, boundaries, invalid input, failures, concurrency, security, backward "
+    "compatibility, regressions; include the test results in your brief and add a test for "
+    "every NO TEST scenario the reviewer marks as a major finding"
+)
 FILE_EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 CHANGES_REQUIRED_MARKER = "VERDICT: CHANGES REQUIRED"
 # the transcript of a long session can be over a gigabyte; a task is only its tail
@@ -960,7 +968,7 @@ def describe_status() -> str:
             else "auto-off: inactive (run `/model-profile repair`, then restart)"
         )
         lines.append(
-            "effort: medium by default; complex -> deep-work skill (high); "
+            "effort: high by default; complex -> deep-work skill (high); "
             "critical -> critical-work skill (Opus, high)"
         )
         lines.append(
@@ -1579,11 +1587,13 @@ def review_instruction(agent: str, after_changes_required: bool) -> str:
             "The last review requested changes. Fix every confirmed blocker or major finding, "
             f"re-run the checks, then call the {agent} agent again on the updated diff"
             " with the task goal, the file list and the `git diff` (plus the content of new files)."
+            f" The reviewer checks every scenario for a test ({SCENARIO_REVIEW_NOTE})."
         )
     return (
         f"An Opus review is required before you finish. Call the {agent} agent with the task "
         "goal, the file list and the `git diff` (plus the content of new files). Fix every "
-        "confirmed blocker or major finding and re-verify."
+        "confirmed blocker or major finding and re-verify. "
+        f"The reviewer checks every scenario for a test ({SCENARIO_REVIEW_NOTE})."
     )
 
 
@@ -2580,7 +2590,7 @@ def register_installed_hooks() -> None:
     )
     if result.returncode != 0:
         raise UpdateRefused(
-            "it was installed, but its hooks could not be registered "
+            "it was installed, but its last setup step failed "
             f"({first_line(result.stderr)}); run the installer again"
         )
 
@@ -2778,7 +2788,19 @@ def refresh_installed_hooks(settings: JsonObject) -> JsonObject:
     except ProfileError as err:
         log_sync_event("warn", "update_channel_damaged", error=str(err))
         refreshed = settings
-    return add_routing_hooks(refreshed) if is_active() else refreshed
+    if not is_active():
+        return refreshed
+    return add_routing_hooks(with_current_profile_settings(refreshed))
+
+
+def with_current_profile_settings(settings: JsonObject) -> JsonObject:
+    """While ON, move a value an earlier version set (and the user left alone) to today's."""
+    upgraded = {
+        key: PROFILE_SETTINGS[key]
+        for key, earlier in EARLIER_PROFILE_SETTINGS.items()
+        if settings.get(key) == earlier
+    }
+    return {**settings, **upgraded} if upgraded else settings
 
 
 def change_hooks(change: Callable[[JsonObject], JsonObject]) -> None:
@@ -2788,10 +2810,16 @@ def change_hooks(change: Callable[[JsonObject], JsonObject]) -> None:
     again once if Claude Code saved settings.json at the same instant.
     """
     with exclusive_lock(HOOKS_LOCK_WAIT_SECONDS):
-        try:
-            apply_settings_change(change)
-        except SettingsChangedError:
-            apply_settings_change(change)
+        apply_settings_change_with_retry(change)
+
+
+def apply_settings_change_with_retry(
+    change: Callable[[JsonObject], JsonObject],
+) -> None:
+    try:
+        apply_settings_change(change)
+    except SettingsChangedError:
+        apply_settings_change(change)
 
 
 def apply_settings_change(change: Callable[[JsonObject], JsonObject]) -> None:
@@ -2802,9 +2830,139 @@ def apply_settings_change(change: Callable[[JsonObject], JsonObject]) -> None:
         write_settings_checked(changed, signature)
 
 
+def replace_copy(source: Path, destination: Path) -> str:
+    """Atomically replace `destination` with `source`; returns the new copy's SHA-256."""
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp"
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "wb") as writer, source.open("rb") as reader:
+            shutil.copyfileobj(reader, writer)
+        shutil.copystat(source, temp_path)
+        temp_path.replace(destination)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return sha256_of(destination)
+
+
+def regular_file_digest(path: Path) -> str | None:
+    """SHA-256 of a regular file that is not a link; None for anything else or unreadable."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        return sha256_of(path)
+    except OSError as err:
+        log_sync_event("warn", "copy_unreadable", path=str(path), error=str(err))
+        return None
+
+
+def refreshed_copies(
+    recorded: dict[str, str],
+    available: list[str],
+    source_of: Callable[[str], Path],
+    installed_copy_of: Callable[[str], Path],
+    claim_of: Callable[[str], Path],
+) -> dict[str, str]:
+    """Bring the copies routing installed up to date with this version's files.
+
+    A copy is ours only while its content is what was installed, or already this version's
+    (a refresh that stopped before recording it). Anything else (edited, a link, a folder,
+    unreadable or deleted) is left exactly as it is and stays recorded, so it is never added
+    again and `off` still leaves it alone. A new file is added only where nothing with its
+    name exists (`claim_of`: the agent file, or the whole skill folder); a file this version
+    no longer ships is removed. Returns the new name -> SHA-256 record.
+    """
+    updated: dict[str, str] = {}
+    for name, digest in recorded.items():
+        installed = installed_copy_of(name)
+        current = regular_file_digest(installed)
+        shipped = sha256_of(source_of(name)) if name in available else None
+        if current is None or current not in (digest, shipped):
+            event = (
+                "copy_left_modified" if os.path.lexists(installed) else "copy_deleted"
+            )
+            log_sync_event("warn", event, path=str(installed))
+            updated[name] = digest
+            continue
+        if shipped is None:
+            installed.unlink()
+            if claim_of(name) != installed:
+                remove_empty_dir(claim_of(name))
+            continue
+        updated[name] = (
+            shipped if current == shipped else replace_copy(source_of(name), installed)
+        )
+    for name in available:
+        installed = installed_copy_of(name)
+        if name in recorded or os.path.lexists(claim_of(name)):
+            continue
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            copy_agent_exclusive(source_of(name), installed)
+        except BaseException:
+            if claim_of(name) != installed:
+                remove_empty_dir(claim_of(name))
+            raise
+        updated[name] = sha256_of(installed)
+    return updated
+
+
+def refresh_installed_copies() -> None:
+    """While routing is ON, give the installed agents and skills this version's content."""
+    if not is_active():
+        return
+    state = load_state()
+    agents_root_existed = os.path.lexists(INSTALLED_AGENTS_DIR)
+    skills_root_existed = os.path.lexists(INSTALLED_SKILLS_DIR)
+    agents = refreshed_copies(
+        state.installed_agents,
+        [path.name for path in profile_agent_files()],
+        lambda name: PROFILE_AGENTS_DIR / name,
+        lambda name: INSTALLED_AGENTS_DIR / name,
+        lambda name: INSTALLED_AGENTS_DIR / name,
+    )
+    skills = refreshed_copies(
+        state.installed_skills,
+        profile_skill_names(),
+        lambda name: PROFILE_SKILLS_DIR / name / SKILL_FILE,
+        lambda name: INSTALLED_SKILLS_DIR / name / SKILL_FILE,
+        lambda name: INSTALLED_SKILLS_DIR / name,
+    )
+    refreshed = replace(
+        state,
+        installed_agents=agents,
+        installed_skills=skills,
+        # a folder this refresh created is removed by `off` like one `on` created
+        created_agents_dir=state.created_agents_dir
+        or (not agents_root_existed and INSTALLED_AGENTS_DIR.is_dir()),
+        created_skills_dir=state.created_skills_dir
+        or (not skills_root_existed and INSTALLED_SKILLS_DIR.is_dir()),
+    )
+    if refreshed == state:
+        return
+    write_json_atomic(STATE_FILE, refreshed.to_json())
+    log_sync_event("info", "copies_refreshed", agents=len(agents), skills=len(skills))
+
+
 def run_install_hooks() -> int:
-    """Run by the installer after every install or update, so an upgrade needs no off/on."""
-    change_hooks(refresh_installed_hooks)
+    """Run by the installer after every install or update, so an upgrade needs no off/on:
+    this version's hooks, agents and skills. The hooks are registered even when the agents
+    and skills cannot be refreshed; that failure is then reported, never hidden."""
+    refresh_error: Exception | None = None
+    with exclusive_lock(HOOKS_LOCK_WAIT_SECONDS):
+        try:
+            refresh_installed_copies()
+        except (ProfileError, OSError) as err:
+            log_sync_event("error", "copies_refresh_failed", error=str(err))
+            refresh_error = err
+        apply_settings_change_with_retry(refresh_installed_hooks)
+    if refresh_error is not None:
+        raise ProfileError(
+            "hooks registered, but the helper agents and skills were not refreshed: "
+            f"{refresh_error}"
+        )
     return EXIT_OK
 
 

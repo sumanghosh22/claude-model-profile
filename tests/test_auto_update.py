@@ -33,7 +33,7 @@ MAJOR, MINOR, PATCH = (int(part) for part in CURRENT.split("."))
 NEWER = f"{MAJOR}.{MINOR + 1}.0"
 NEWEST = f"{MAJOR}.{MINOR + 2}.0"
 NEXT_MAJOR = f"{MAJOR + 1}.0.0"
-BASELINE_SETTINGS = {"model": "sonnet", "effortLevel": "high"}
+BASELINE_SETTINGS = {"model": "sonnet", "effortLevel": "low"}
 OVERSIZED_BYTES = 6 * 1024 * 1024
 DEEPLY_NESTED_JSON = b"[" * 200_000
 HOOK_MAX_SECONDS = 5
@@ -542,7 +542,7 @@ class TestHooksAndSwitches(AutoUpdateTestCase):
         self.hold_lock(".lock", 30)
         message = self.auto_update()["systemMessage"]
         self.assertIn(f"{NEWER} was not installed", message)
-        self.assertIn("hooks could not be registered", message)
+        self.assertIn("its last setup step failed", message)
         self.assertIn("run the installer again", message)
 
     def test_uninstall_waits_for_a_running_update(self) -> None:

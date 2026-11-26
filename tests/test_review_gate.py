@@ -280,6 +280,7 @@ class TestReviewOutcome(ReviewGateTestCase):
         self.record_review("code-reviewer", "VERDICT: CHANGES REQUIRED", "toolu_1")
         reason = self.assert_blocks_for_changes(self.gate())
         self.assertIn("The last review requested changes", reason)
+        self.assertIn("The reviewer checks every scenario for a test", reason)
         self.record_review("code-reviewer", "VERDICT: APPROVE", "toolu_2")
         self.assertIsNone(self.gate())
 

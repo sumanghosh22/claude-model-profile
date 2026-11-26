@@ -138,7 +138,7 @@ class TestLegacyHookUpgrade(SandboxTestCase):
 BASELINE_SETTINGS_WITH_USER_HOOKS = {
     "env": {"PATH": "/usr/bin"},
     "model": "sonnet",
-    "effortLevel": "high",
+    "effortLevel": "low",
     "hooks": USER_HOOKS,
 }
 
@@ -266,7 +266,7 @@ class TestConcurrentSettingsWrites(SandboxTestCase):
 
 BASELINE_SETTINGS_DICT = {
     "env": {"PATH": "/usr/bin"},
-    "effortLevel": "high",
+    "effortLevel": "low",
     "model": "sonnet",
     "permissions": {"allow": ["Bash(ls:*)"]},
 }

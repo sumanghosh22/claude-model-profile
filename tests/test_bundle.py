@@ -24,7 +24,7 @@ EXIT_USAGE = 2
 BUILD_SCRIPT = ROOT / "scripts" / "build_bundle.py"
 VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 BUNDLE_NAME = "install-claude-model-profile.sh"
-BASELINE_SETTINGS = {"model": "sonnet", "effortLevel": "high"}
+BASELINE_SETTINGS = {"model": "sonnet", "effortLevel": "low"}
 # every install registers exactly this one hook, outside routing, for daily signed updates
 UPDATE_HOOK_SETTINGS = {
     "hooks": {
@@ -181,7 +181,7 @@ class TestOneCommandInstall(BundleTestCase):
         self.assertEqual(result.returncode, EXIT_OK, result.stderr)
         settings = json.loads(self.settings.read_text())
         self.assertEqual(
-            (settings["model"], settings["effortLevel"]), ("opusplan", "medium")
+            (settings["model"], settings["effortLevel"]), ("opusplan", "high")
         )
         out = result.stdout
         self.assertIn(f"Claude Model Profile {VERSION}", out)

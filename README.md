@@ -66,7 +66,7 @@ Either way it installs and switches routing on. Then **restart Claude Code** and
 
 | Task | What runs |
 |---|---|
-| Questions, explanations, small edits | Sonnet at medium effort |
+| Questions, explanations, small edits | Sonnet at high effort |
 | Debugging, refactors, multi-file changes, performance work, features | the `deep-work` skill: high effort for that message |
 | Security, auth, billing and payments, migrations, production incidents, concurrency, or "still failing" | the `critical-work` skill: Opus at high effort for that message |
 
@@ -77,7 +77,7 @@ A question that only mentions billing or auth stays cheap. The check only sugges
 **A change cannot be finished until it is proven and reviewed.** When a task changed files, Claude is asked for three things, in one message:
 
 1. **A passing check.** A test, lint, type-check or build command must have run and passed *after the last edit*. Documentation-only changes are exempt.
-2. **An Opus review.** Small changes go to `code-reviewer` (Opus, medium effort); large or risky ones (auth, billing, payments, security, secrets, migrations, webhooks, over 150 lines or 8 files) go to `deep-reasoner` (Opus, high effort). A `CHANGES REQUIRED` verdict means fix and review again.
+2. **An Opus review.** Small changes go to `code-reviewer` (Opus, high effort); large or risky ones (auth, billing, payments, security, secrets, migrations, webhooks, over 150 lines or 8 files) go to `deep-reasoner` (Opus, high effort). A `CHANGES REQUIRED` verdict means fix and review again. Both reviewers also list every scenario the change can meet (normal path, boundaries, invalid input, failures, concurrency, security, backward compatibility, each bug fixed) with the test that covers it; any scenario without a test is a major finding, so the change is sent back until it has one.
 3. **No secrets in new code.** The lines you added are scanned for real key formats (AWS, Stripe live, GitHub, GitLab, Slack, Google, Anthropic, OpenAI, private keys) and hard-coded passwords. Only file, line and kind are reported, never the value. Test fixtures are not flagged for passwords.
 
 **Every task is checked after it finishes, not only code changes.** When Claude stops, its final answer is compared with what actually ran in that turn:
@@ -86,7 +86,7 @@ A question that only mentions billing or auth stays cheap. The check only sugges
 - In critical work it states facts about data or production (numbers over 999, rows, keys, tables, queries) while **no tool ran** and without saying "not verified" or "inferred" → sent back once to verify with a read-only tool or label it honestly.
 - It says "I verified / checked / ran…" or "tests pass" while no tool ran in that turn → a free **notice** to you ("treat it as unverified"), not a block, because answers often summarise work from earlier messages.
 
-Each message is sent back at most once, never in a loop, and the answer is never stored or logged. On two weeks of the author's real use: 4 send-backs and 14 notices across 670 tasks. A seventh default standard also asks every answer to say what was verified and how, and what was not.
+Each message is sent back at most once, never in a loop, and the answer is never stored or logged. On two weeks of the author's real use: 4 send-backs and 14 notices across 670 tasks. Two default standards back this up: every answer says what was verified and how, and what was not; and every scenario is tested, none skipped.
 
 It never traps a session: after two requests it lets Claude finish and tells you what is still missing. Questions and explanations that change nothing are never checked, so they cost nothing extra. Expect the Opus review to add some token cost to every code change; that is the price of the safety net.
 
